@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "pick_implementation": {
+        "title": "Authenticate with DiapStash"
+      }
+    },
+    "abort": {
+      "already_configured": "DiapStash is already configured.",
+      "oauth_error": "Received invalid token data.",
+      "oauth_unauthorized": "OAuth authorisation was rejected by DiapStash.",
+      "oauth_timeout": "Timeout resolving OAuth token.",
+      "oauth_app_deletion_error": "Failed to delete app credentials.",
+      "missing_configuration": "The integration is not configured. Please follow the documentation.",
+      "reauth_successful": "Re-authentication was successful."
+    },
+    "create_entry": {
+      "default": "Successfully authenticated with DiapStash."
+    }
+  }
+}
