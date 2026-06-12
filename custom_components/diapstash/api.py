@@ -10,6 +10,33 @@ from .const import API_BASE_URL
 
 _LOGGER = logging.getLogger(__name__)
 
+_RATELIMIT_WARN_THRESHOLD = 10
+
+
+def _parse_ratelimit_header(value: str) -> dict[str, int]:
+    """Parse IETF RateLimit header (draft-ietf-httpapi-ratelimit-headers-08).
+
+    DiapStash docs use 'w' for reset seconds; IETF uses 't' — both parsed.
+    """
+    result: dict[str, int] = {}
+    for part in value.split(";")[1:]:  # skip quoted name token
+        part = part.strip()
+        if "=" in part:
+            key, _, raw = part.partition("=")
+            try:
+                result[key.strip()] = int(raw.strip())
+            except ValueError:
+                pass
+    return result
+
+
+class DiapStashRateLimitError(Exception):
+    """Raised on HTTP 429; carries the raw RateLimit header for backoff calculation."""
+
+    def __init__(self, ratelimit_header: str) -> None:
+        self.ratelimit_header = ratelimit_header
+        super().__init__("Rate limit exceeded")
+
 
 class DiapStashApiClient:
     """Thin wrapper around the DiapStash REST API."""
@@ -29,7 +56,22 @@ class DiapStashApiClient:
             params=params,
             headers={"DS-API-CLIENT-ID": self._client_id},
         )
+        if resp.status == 429:
+            raise DiapStashRateLimitError(resp.headers.get("RateLimit", ""))
         resp.raise_for_status()
+
+        rl_header = resp.headers.get("RateLimit")
+        if rl_header:
+            rl = _parse_ratelimit_header(rl_header)
+            remaining = rl.get("r")
+            if remaining is not None and remaining < _RATELIMIT_WARN_THRESHOLD:
+                reset_in = rl.get("t") or rl.get("w")
+                _LOGGER.warning(
+                    "DiapStash quota low: %d requests remaining (resets in %s s).",
+                    remaining,
+                    reset_in if reset_in is not None else "?",
+                )
+
         return await resp.json()
 
     async def get_current_change(self) -> dict[str, Any] | None:

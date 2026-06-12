@@ -8,4 +8,6 @@ OAUTH_TOKEN_URL = "https://account.diapstash.com/oidc/token"
 
 SCOPES = ["cloud-sync.history", "cloud-sync.types"]
 
-SCAN_INTERVAL_SECONDS = 300  # 5 minutes — respectful of no documented rate limit
+DEFAULT_SCAN_INTERVAL = 5   # minutes
+# 120 req/hr ÷ 3 requests per regular poll (types cached) = 40 polls/hr max → 1 min floor
+MIN_SCAN_INTERVAL = 1       # minutes
