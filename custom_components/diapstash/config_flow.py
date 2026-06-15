@@ -23,7 +23,7 @@ class DiapStashOAuth2FlowHandler(
 
     @property
     def extra_authorize_data(self) -> dict[str, Any]:
-        return {"scope": " ".join(SCOPES)}
+        return {"scope": " ".join(SCOPES), "prompt": "consent"}
 
     async def async_oauth_create_entry(self, data: dict[str, Any]) -> dict[str, Any]:
         """Create the config entry after a successful OAuth2 authorization."""

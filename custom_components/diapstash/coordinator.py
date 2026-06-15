@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import DiapStashApiClient, DiapStashRateLimitError, _parse_ratelimit_header
@@ -16,6 +16,16 @@ from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, MIN_SCAN_INTERVAL
 _LOGGER = logging.getLogger(__name__)
 
 _API_TIMEOUT = 30
+
+
+def _parse_utc(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 UTC timestamp string; return None on missing or invalid input."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -33,6 +43,7 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._client = client
         self._cached_diaper_types: dict[int, str] = {}
+        self._cache_miss_ids: set[int] = set()
 
     async def _async_update_data(self) -> dict[str, Any]:
         self.update_interval = self._normal_update_interval  # heal any prior backoff
@@ -41,6 +52,8 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return await self._fetch()
         except ConfigEntryAuthFailed:
             raise
+        except HomeAssistantError as err:
+            raise ConfigEntryAuthFailed(str(err)) from err
         except DiapStashRateLimitError as err:
             rl = _parse_ratelimit_header(err.ratelimit_header)
             reset_in = rl.get("t") or rl.get("w")
@@ -70,15 +83,24 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         accidents_for_change: list[dict[str, Any]] = []
         if current_change is not None:
             change_id = current_change["id"]
+            change_start = _parse_utc(current_change.get("startTime"))
             try:
                 all_accidents = await self._client.get_accidents()
             except aiohttp.ClientResponseError as err:
                 if err.status == 401:
                     raise ConfigEntryAuthFailed("DiapStash token expired") from err
                 raise
-            accidents_for_change = [
-                a for a in all_accidents if a.get("linkedChangeId") == change_id
-            ]
+            for a in all_accidents:
+                linked = a.get("linkedChangeId")
+                if linked is not None:
+                    # Accident already back-linked to a specific change
+                    if linked == change_id:
+                        accidents_for_change.append(a)
+                elif change_start is not None:
+                    # linkedChangeId is null while change is active — include by timestamp
+                    when = _parse_utc(a.get("when"))
+                    if when is not None and when >= change_start:
+                        accidents_for_change.append(a)
 
         try:
             last_accident = await self._client.get_last_accident()
@@ -94,8 +116,22 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 custom_types = await self._client.get_custom_diaper_types()
                 diaper_types.update(custom_types)
                 self._cached_diaper_types = diaper_types
+                self._cache_miss_ids.clear()
             except Exception:
                 _LOGGER.debug("Failed to fetch diaper types; names will fall back to type IDs")
+
+        # If any currently-worn typeId is missing, schedule a one-shot cache re-fetch next poll
+        diapers = (current_change or {}).get("diapers") or []
+        used_ids = {d.get("typeId") for d in diapers if d.get("typeId") is not None}
+        missing_ids = used_ids - set(self._cached_diaper_types.keys())
+        new_missing = missing_ids - self._cache_miss_ids
+        if new_missing and self._cached_diaper_types:
+            _LOGGER.debug(
+                "DiapStash: typeId(s) %s not in type cache — clearing for re-fetch next poll",
+                new_missing,
+            )
+            self._cache_miss_ids.update(new_missing)
+            self._cached_diaper_types = {}
 
         return {
             "current_change": current_change,
