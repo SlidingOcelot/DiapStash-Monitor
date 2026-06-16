@@ -2,6 +2,8 @@
 
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 
+> **Vibe coded disclaimer:** This integration was built with AI pair programming assistance (Claude). It works, but has not been formally audited or extensively tested. Use at your own risk, contributions welcome.
+
 A [Home Assistant](https://www.home-assistant.io/) integration that polls the [DiapStash](https://diapstash.com) Cloud Sync API and exposes three sensors.
 
 ## Sensors

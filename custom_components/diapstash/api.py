@@ -10,16 +10,23 @@ from .const import API_BASE_URL
 
 _LOGGER = logging.getLogger(__name__)
 
+# Log a warning when fewer than this many requests remain in the current quota window.
+# Gives the user a heads-up before hitting HTTP 429 and triggering backoff.
 _RATELIMIT_WARN_THRESHOLD = 10
 
 
 def _parse_ratelimit_header(value: str) -> dict[str, int]:
     """Parse IETF RateLimit header (draft-ietf-httpapi-ratelimit-headers-08).
 
-    DiapStash docs use 'w' for reset seconds; IETF uses 't' — both parsed.
+    Expected format: 'quota-policy="name"; r=<remaining>; t=<seconds-to-reset>'
+    The first token is the quoted policy name and is skipped (split on ';')[1:]).
+
+    DiapStash docs use 'w' as the reset-seconds key; the IETF draft uses 't'.
+    Both are parsed so the coordinator backoff logic works regardless of which key
+    the server sends.
     """
     result: dict[str, int] = {}
-    for part in value.split(";")[1:]:  # skip quoted name token
+    for part in value.split(";")[1:]:  # skip the quoted name token
         part = part.strip()
         if "=" in part:
             key, _, raw = part.partition("=")
@@ -39,7 +46,13 @@ class DiapStashRateLimitError(Exception):
 
 
 class DiapStashApiClient:
-    """Thin wrapper around the DiapStash REST API."""
+    """Thin wrapper around the DiapStash REST API.
+
+    All requests are authenticated via the HA OAuth2 session (token refresh is
+    handled transparently by OAuth2Session.async_request). The DS-API-CLIENT-ID
+    header is required by the DiapStash API on every request alongside the Bearer
+    token — it identifies which registered OAuth client is making the call.
+    """
 
     def __init__(
         self,
@@ -50,16 +63,28 @@ class DiapStashApiClient:
         self._client_id = client_id
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Perform an authenticated GET and return the parsed JSON body.
+
+        Rate-limit handling:
+          - HTTP 429 raises DiapStashRateLimitError with the raw RateLimit header so
+            the coordinator can calculate the exact backoff duration.
+          - Other non-2xx responses raise via raise_for_status() and propagate up.
+          - When remaining quota drops below _RATELIMIT_WARN_THRESHOLD a warning is
+            logged proactively so the user can act before backoff kicks in.
+        """
         resp = await self._session.async_request(
             "GET",
             f"{API_BASE_URL}{path}",
             params=params,
             headers={"DS-API-CLIENT-ID": self._client_id},
         )
+
+        # Check for rate-limit before raise_for_status so we can capture the header.
         if resp.status == 429:
             raise DiapStashRateLimitError(resp.headers.get("RateLimit", ""))
         resp.raise_for_status()
 
+        # Proactive quota warning on successful responses.
         rl_header = resp.headers.get("RateLimit")
         if rl_header:
             rl = _parse_ratelimit_header(rl_header)
@@ -75,7 +100,13 @@ class DiapStashApiClient:
         return await resp.json()
 
     async def get_current_change(self) -> dict[str, Any] | None:
-        """Return the active change (endTime is null) or None."""
+        """Return the active change (endTime is null) or None.
+
+        Fetches only the most recent change sorted by startTime desc. A change is
+        considered active when its endTime field is null — the server sets endTime
+        when the user closes the change in the app. If the most recent change is
+        already closed, there is no active change and None is returned.
+        """
         data = await self._get(
             "/api/v1/history/changes",
             params={"size": 1, "sort": "startTime,desc"},
@@ -86,7 +117,13 @@ class DiapStashApiClient:
         return None
 
     async def get_accidents(self, size: int = 200) -> list[dict[str, Any]]:
-        """Return the most recent accidents, newest first."""
+        """Return the most recent accidents, newest first.
+
+        size=200 is large enough to cover all accidents for a typical multi-day period
+        without hitting API pagination. The coordinator uses this list to populate
+        both accidents_for_change and accidents_outside_change, so it must include
+        accidents before the current change's startTime.
+        """
         data = await self._get(
             "/api/v1/history/accidents",
             params={"size": size, "sort": "when,desc"},
@@ -94,7 +131,13 @@ class DiapStashApiClient:
         return data.get("data", [])
 
     async def get_last_accident(self) -> dict[str, Any] | None:
-        """Return the single most recent accident."""
+        """Return the single most recent accident, regardless of change context.
+
+        This is a separate call from get_accidents() even though it returns a subset
+        of the same data. It is kept as a dedicated call so the LastAccidentSensor can
+        show a globally most-recent accident independently of the coordinator's accident
+        partitioning logic.
+        """
         data = await self._get(
             "/api/v1/history/accidents",
             params={"size": 1, "sort": "when,desc"},
@@ -103,11 +146,15 @@ class DiapStashApiClient:
         return accidents[0] if accidents else None
 
     async def get_diaper_types(self) -> dict[int, str]:
-        """Return a mapping of typeId -> display name from the public type catalogue."""
+        """Return a mapping of typeId → display name from the public type catalogue."""
         data = await self._get("/api/v1/type/types", params={"size": 200})
         return {t["id"]: t.get("name", str(t["id"])) for t in data.get("data", [])}
 
     async def get_custom_diaper_types(self) -> dict[int, str]:
-        """Return user-defined types (merged on top of catalogue types)."""
+        """Return user-defined types (merged on top of catalogue types by the coordinator).
+
+        Custom types take precedence over public catalogue entries with the same id
+        when the coordinator calls dict.update(custom_types) after fetching both.
+        """
         data = await self._get("/api/v1/type/types/custom", params={"size": 200})
         return {t["id"]: t.get("name", str(t["id"])) for t in data.get("data", [])}

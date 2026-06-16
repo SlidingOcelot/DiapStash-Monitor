@@ -9,11 +9,21 @@ from .api import DiapStashApiClient
 from .const import DOMAIN
 from .coordinator import DiapStashCoordinator
 
-PLATFORMS = ["sensor"]
+# All HA platform types that this integration registers entities on.
+# Adding "binary_sensor" here causes HA to call async_setup_entry in binary_sensor.py
+# during integration load. Order does not matter — HA sets up platforms in parallel.
+PLATFORMS = ["sensor", "binary_sensor"]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up DiapStash from a config entry."""
+    """Set up DiapStash from a config entry.
+
+    The coordinator is stored in hass.data keyed by entry_id so each platform's
+    async_setup_entry can retrieve it. We use hass.data rather than entry.runtime_data
+    because this integration targets HA versions that may not support runtime_data.
+    """
+    # Resolve the OAuth2 implementation registered via application_credentials.
+    # This provides the token URL, client id, and handles token refresh automatically.
     implementation = await config_entry_oauth2_flow.async_get_config_entry_implementation(
         hass, entry
     )
@@ -24,6 +34,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     coordinator = DiapStashCoordinator(hass, client)
+    # Perform the first data fetch synchronously so HA can report setup failure
+    # immediately (e.g. auth error, network unreachable) rather than deferring it.
     await coordinator.async_config_entry_first_refresh()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator

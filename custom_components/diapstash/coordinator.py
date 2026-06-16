@@ -15,11 +15,17 @@ from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, MIN_SCAN_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
+# Hard timeout per full refresh cycle. Keeps a slow API from blocking HA's event loop.
 _API_TIMEOUT = 30
 
 
 def _parse_utc(value: str | None) -> datetime | None:
-    """Parse an ISO-8601 UTC timestamp string; return None on missing or invalid input."""
+    """Parse an ISO-8601 UTC timestamp string into a timezone-aware datetime.
+
+    DiapStash uses 'Z' suffix for UTC. Python's fromisoformat() does not understand
+    'Z' before 3.11, so we replace it with '+00:00' for broad compatibility.
+    Returns None on missing or malformed input so callers can treat it as "unknown".
+    """
     if not value:
         return None
     try:
@@ -29,9 +35,16 @@ def _parse_utc(value: str | None) -> datetime | None:
 
 
 class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Single coordinator that fetches all DiapStash data used by the sensors."""
+    """Single coordinator that fetches all DiapStash data used by the sensors.
+
+    All sensors share one coordinator so the integration makes exactly one set of
+    API calls per poll cycle instead of one per sensor.
+    """
 
     def __init__(self, hass: HomeAssistant, client: DiapStashApiClient) -> None:
+        # Store the intended interval separately so we can always heal back to it
+        # after a rate-limit backoff. The coordinator's update_interval attribute is
+        # mutated during backoff; _normal_update_interval is the canonical default.
         self._normal_update_interval = timedelta(
             minutes=max(DEFAULT_SCAN_INTERVAL, MIN_SCAN_INTERVAL)
         )
@@ -42,21 +55,43 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=self._normal_update_interval,
         )
         self._client = client
+
+        # typeId → display name cache. Populated on first successful poll and reused
+        # on subsequent polls to avoid fetching the type catalogue every 5 minutes.
         self._cached_diaper_types: dict[int, str] = {}
+
+        # Tracks typeIds that were already tried and not found in any catalogue.
+        # Prevents an infinite re-fetch loop when a typeId is genuinely absent:
+        # on first miss we clear the cache for one re-fetch; after that second miss
+        # the id is added here and no further cache clears are triggered for it.
         self._cache_miss_ids: set[int] = set()
 
     async def _async_update_data(self) -> dict[str, Any]:
-        self.update_interval = self._normal_update_interval  # heal any prior backoff
+        # Heal any prior rate-limit backoff at the start of each successful cycle.
+        # This ensures the interval self-corrects without requiring a restart.
+        self.update_interval = self._normal_update_interval
+
         try:
             async with asyncio.timeout(_API_TIMEOUT):
                 return await self._fetch()
+
+        # ConfigEntryAuthFailed must bubble up first so HA can show the re-auth UI.
+        # It is a subclass of HomeAssistantError, so the order of the two handlers matters.
         except ConfigEntryAuthFailed:
             raise
+
+        # HA's OAuth2 session raises HomeAssistantError when token refresh fails.
+        # Re-raise as ConfigEntryAuthFailed so HA disables the integration and prompts
+        # the user to re-authenticate rather than retrying forever.
         except HomeAssistantError as err:
             raise ConfigEntryAuthFailed(str(err)) from err
+
+        # On HTTP 429 the API returns a RateLimit header with quota and reset time.
+        # We extend update_interval until the quota window resets (+5 s buffer),
+        # then raise UpdateFailed so HA marks the sensors unavailable until recovery.
         except DiapStashRateLimitError as err:
             rl = _parse_ratelimit_header(err.ratelimit_header)
-            reset_in = rl.get("t") or rl.get("w")
+            reset_in = rl.get("t") or rl.get("w")  # 't' = IETF draft, 'w' = DiapStash docs
             if reset_in:
                 self.update_interval = timedelta(seconds=reset_in + 5)
                 _LOGGER.warning(
@@ -67,12 +102,26 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 _LOGGER.warning("DiapStash rate limit reached. No reset time in RateLimit header.")
             raise UpdateFailed("DiapStash rate limit reached") from err
+
         except Exception as err:
             raise UpdateFailed(f"Error communicating with DiapStash API: {err}") from err
 
     async def _fetch(self) -> dict[str, Any]:
+        """Fetch all data from the DiapStash API and return it as a single dict.
+
+        Data flow:
+          1. Fetch the active change (most recent change with endTime == null).
+          2. Fetch all recent accidents and partition them into two lists:
+               - accidents_for_change:  accidents that happened during the active change.
+               - accidents_outside_change: accidents that happened between changes.
+          3. Fetch the globally most-recent accident (for the LastAccidentSensor).
+          4. Fetch the diaper type catalogue (cached; refreshed only on cache miss).
+        """
         import aiohttp
 
+        # --- Step 1: Active change ---
+        # A change is considered active when its endTime is null.
+        # Returns None when the child is between changes (not wearing a diaper).
         try:
             current_change = await self._client.get_current_change()
         except aiohttp.ClientResponseError as err:
@@ -80,28 +129,57 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise ConfigEntryAuthFailed("DiapStash token expired") from err
             raise
 
+        # --- Step 2: Accident partitioning ---
+        # Accidents are always fetched, regardless of whether a change is active.
+        # This is needed to populate accidents_outside_change when not wearing.
         accidents_for_change: list[dict[str, Any]] = []
-        if current_change is not None:
-            change_id = current_change["id"]
-            change_start = _parse_utc(current_change.get("startTime"))
-            try:
-                all_accidents = await self._client.get_accidents()
-            except aiohttp.ClientResponseError as err:
-                if err.status == 401:
-                    raise ConfigEntryAuthFailed("DiapStash token expired") from err
-                raise
-            for a in all_accidents:
-                linked = a.get("linkedChangeId")
-                if linked is not None:
-                    # Accident already back-linked to a specific change
-                    if linked == change_id:
-                        accidents_for_change.append(a)
-                elif change_start is not None:
-                    # linkedChangeId is null while change is active — include by timestamp
+        accidents_outside_change: list[dict[str, Any]] = []
+        try:
+            all_accidents = await self._client.get_accidents()
+        except aiohttp.ClientResponseError as err:
+            if err.status == 401:
+                raise ConfigEntryAuthFailed("DiapStash token expired") from err
+            raise
+
+        # Extract change identity for comparison. When current_change is None these
+        # will both be None and all null-linked accidents fall into outside_change.
+        change_id = (current_change or {}).get("id")
+        change_start = _parse_utc((current_change or {}).get("startTime"))
+
+        for a in all_accidents:
+            linked = a.get("linkedChangeId")
+
+            if linked is not None:
+                # The accident has been back-linked to a specific change by the server.
+                # DiapStash only fills this field when the change closes, so during an
+                # active change all accidents will have linkedChangeId == null.
+                if linked == change_id:
+                    accidents_for_change.append(a)
+                # Accidents linked to a past (closed) change are ignored in both lists;
+                # they are historical data not relevant to the current sensor readings.
+
+            else:
+                # linkedChangeId is null — the accident has not been linked yet.
+                # This is the normal state for all accidents during an active change.
+                # We decide which list it belongs to by comparing its timestamp against
+                # the change start time:
+                #   >= change_start → happened during the current change (unlinked yet)
+                #   <  change_start → happened before this change started (bare accident)
+                # When there is no active change, all null-linked accidents are bare.
+                if change_start is not None:
                     when = _parse_utc(a.get("when"))
                     if when is not None and when >= change_start:
                         accidents_for_change.append(a)
+                    else:
+                        accidents_outside_change.append(a)
+                else:
+                    # No active change → every null-linked accident is outside a change.
+                    accidents_outside_change.append(a)
 
+        # --- Step 3: Global last accident ---
+        # Fetched separately from get_accidents() because it is a dedicated single-item
+        # call that is independent of change context; the LastAccidentSensor shows it
+        # regardless of whether a change is currently active.
         try:
             last_accident = await self._client.get_last_accident()
         except aiohttp.ClientResponseError as err:
@@ -109,18 +187,28 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise ConfigEntryAuthFailed("DiapStash token expired") from err
             raise
 
-        # Fetch public + custom types only on first load; reuse cache on subsequent polls
+        # --- Step 4: Diaper type cache ---
+        # The type catalogue (public + custom) is fetched once and reused.
+        # Re-fetched when the cache is empty, which happens in two cases:
+        #   a) First poll after startup.
+        #   b) A cache miss was detected on the previous poll (see below).
         if not self._cached_diaper_types:
             try:
                 diaper_types: dict[int, str] = await self._client.get_diaper_types()
                 custom_types = await self._client.get_custom_diaper_types()
+                # Custom types take precedence over public catalogue entries with the same id.
                 diaper_types.update(custom_types)
                 self._cached_diaper_types = diaper_types
                 self._cache_miss_ids.clear()
             except Exception:
                 _LOGGER.debug("Failed to fetch diaper types; names will fall back to type IDs")
 
-        # If any currently-worn typeId is missing, schedule a one-shot cache re-fetch next poll
+        # Cache miss detection: if the currently-worn diaper has a typeId that is not
+        # in the cache (e.g. a custom type added after the last restart), clear the
+        # cache so it re-fetches on the very next poll.
+        # _cache_miss_ids prevents an infinite clear→re-fetch→miss loop when a typeId
+        # is genuinely absent from all catalogues — after one re-fetch attempt the id
+        # is recorded here and no further cache clears are triggered for it.
         diapers = (current_change or {}).get("diapers") or []
         used_ids = {d.get("typeId") for d in diapers if d.get("typeId") is not None}
         missing_ids = used_ids - set(self._cached_diaper_types.keys())
@@ -131,11 +219,12 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 new_missing,
             )
             self._cache_miss_ids.update(new_missing)
-            self._cached_diaper_types = {}
+            self._cached_diaper_types = {}  # triggers re-fetch on the next poll cycle
 
         return {
             "current_change": current_change,
             "accidents_for_change": accidents_for_change,
+            "accidents_outside_change": accidents_outside_change,
             "last_accident": last_accident,
             "diaper_types": self._cached_diaper_types,
         }
