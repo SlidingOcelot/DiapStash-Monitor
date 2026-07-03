@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import config_entry_oauth2_flow
 
 from .api import DiapStashApiClient
@@ -32,6 +33,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         oauth_session=oauth_session,
         client_id=implementation.client_id,
     )
+
+    # Fail immediately if no refresh token is stored. This happens when offline_access
+    # was not granted during authorization (the consent screen was skipped or denied).
+    # Without a refresh token the integration will silently fail after the first 1-hour
+    # access-token expiry instead of prompting the user to re-authorize now.
+    token = entry.data.get("token", {})
+    if not token.get("refresh_token"):
+        raise ConfigEntryAuthFailed(
+            "No refresh token stored. Re-authorize and accept the offline_access "
+            "consent prompt to enable long-lived token refresh."
+        )
 
     coordinator = DiapStashCoordinator(hass, client)
     # Perform the first data fetch synchronously so HA can report setup failure

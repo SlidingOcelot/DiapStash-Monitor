@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from homeassistant.config_entries import SOURCE_REAUTH
 from homeassistant.helpers import config_entry_oauth2_flow
 
 from .const import DOMAIN, SCOPES
@@ -38,6 +39,36 @@ class DiapStashOAuth2FlowHandler(
         """
         return {"scope": " ".join(SCOPES), "prompt": "consent"}
 
+    async def async_step_reauth(self, entry_data: dict[str, Any]) -> dict[str, Any]:
+        """Called automatically by HA when ConfigEntryAuthFailed is raised.
+
+        HA creates a new config flow with source=SOURCE_REAUTH and calls this method.
+        We show a confirmation form first so the user understands what is happening
+        before the OAuth browser window opens.
+        """
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Confirm dialog — clicking Submit opens the DiapStash authorization page."""
+        if user_input is None:
+            return self.async_show_form(step_id="reauth_confirm")
+        # Proceed to the standard OAuth2 authorization flow.
+        return await self.async_step_user()
+
     async def async_oauth_create_entry(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Create the config entry after a successful OAuth2 authorization."""
+        """Create the config entry or update the existing one when re-authenticating.
+
+        During re-auth (source == SOURCE_REAUTH), we update the existing entry with
+        the new token data and reload it rather than creating a duplicate entry.
+        During initial setup, we create a fresh entry as normal.
+        """
+        if self.context.get("source") == SOURCE_REAUTH:
+            entry_id = self.context.get("entry_id")
+            existing = self.hass.config_entries.async_get_entry(entry_id)
+            if existing:
+                self.hass.config_entries.async_update_entry(existing, data=data)
+                await self.hass.config_entries.async_reload(existing.entry_id)
+                return self.async_abort(reason="reauth_successful")
         return self.async_create_entry(title="DiapStash", data=data)

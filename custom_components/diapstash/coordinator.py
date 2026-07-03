@@ -81,9 +81,13 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise
 
         # HA's OAuth2 session raises HomeAssistantError when token refresh fails.
-        # Re-raise as ConfigEntryAuthFailed so HA disables the integration and prompts
-        # the user to re-authenticate rather than retrying forever.
+        # Re-raise as ConfigEntryAuthFailed so HA disables the integration and shows
+        # a Repair notification that triggers the async_step_reauth flow in config_flow.py.
         except HomeAssistantError as err:
+            _LOGGER.warning(
+                "DiapStash token refresh failed — the refresh token has likely expired "
+                "(14-day TTL). HA will show a Repair notification: click Fix to re-authorize."
+            )
             raise ConfigEntryAuthFailed(str(err)) from err
 
         # On HTTP 429 the API returns a RateLimit header with quota and reset time.

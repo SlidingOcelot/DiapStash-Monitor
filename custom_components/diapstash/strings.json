@@ -3,6 +3,10 @@
     "step": {
       "pick_implementation": {
         "title": "Authenticate with DiapStash"
+      },
+      "reauth_confirm": {
+        "title": "Re-authorize DiapStash",
+        "description": "Your DiapStash authorization has expired (refresh tokens have a 14-day lifetime). Click Submit to open the DiapStash login page and issue a new token."
       }
     },
     "abort": {
