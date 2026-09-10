@@ -57,11 +57,13 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._client = client
 
         # typeId → display name / image URL caches.
-        # Refreshed on startup and once per hour (every _TYPE_REFRESH_POLLS polls).
+        # Populated on demand: only types actually referenced by the active change are
+        # fetched. Types are immutable so the cache never needs to be invalidated.
+        # A type mapped to its raw str(id) indicates a previous lookup returned no
+        # result from either endpoint and will not be retried.
         self._cached_diaper_types: dict[int, str] = {}
         self._cached_diaper_type_images: dict[int, str] = {}
         self._cached_diaper_variant_images: dict[str, str] = {}
-        self._type_poll_count: int = 0
 
     async def _async_update_data(self) -> dict[str, Any]:
         # Heal any prior rate-limit backoff at the start of each successful cycle.
@@ -130,11 +132,6 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise ConfigEntryAuthFailed("DiapStash token expired") from err
             raise
 
-        # Diagnostic: log what the active change's diapers look like so we can
-        # compare typeId values against the catalogue keys.
-        if current_change:
-            _LOGGER.warning("DiapStash current change diapers: %s", current_change.get("diapers"))
-
         # --- Step 2: Accident partitioning ---
         # Accidents are always fetched, regardless of whether a change is active.
         # This is needed to populate accidents_outside_change when not wearing.
@@ -199,47 +196,49 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise ConfigEntryAuthFailed("DiapStash token expired") from err
             raise
 
-        # --- Step 4: Diaper type cache ---
-        # Refresh the type catalogue on startup and then once per hour.
-        # At the default 5-min scan interval, 12 polls ≈ 1 hour.
-        # Public and custom types are fetched in separate try/except blocks so a
-        # failure in one does not prevent the other from loading.
-        # IDs are normalised to int because JSON parsers on some runtimes may return
-        # them as strings, and a str/int mismatch in dict lookup silently falls through.
-        _TYPE_REFRESH_POLLS = 12
-        self._type_poll_count += 1
-        if not self._cached_diaper_types or self._type_poll_count >= _TYPE_REFRESH_POLLS:
-            self._type_poll_count = 0
-            merged: dict[int, str] = {}
-            merged_type_images: dict[int, str] = {}
-            merged_variant_images: dict[str, str] = {}
+        # --- Step 4: Diaper type cache (on-demand) ---
+        # Fetch type details only for typeIds present in the current change that are
+        # not already cached. The public endpoint is tried first; if it returns 404
+        # the type is user-created and the custom endpoint is tried as a fallback.
+        # Types are immutable so the cache is never invalidated.
+        # A 401 propagates immediately to trigger re-auth. Other per-type errors are
+        # logged at debug and retried on the next poll without caching the failure.
+        # A type that returns 404 from both endpoints is stored as str(id) so it is
+        # not retried repeatedly (unknown/deleted types).
+        if current_change:
+            needed_ids: set[int] = set()
+            for d in current_change.get("diapers") or []:
+                raw = d.get("typeId")
+                try:
+                    needed_ids.add(int(raw))
+                except (TypeError, ValueError):
+                    pass
+            for type_id in needed_ids - self._cached_diaper_types.keys():
+                try:
+                    type_obj = await self._client.get_diaper_type(type_id)
+                    if type_obj is None:
+                        type_obj = await self._client.get_custom_diaper_type(type_id)
+                except aiohttp.ClientResponseError as err:
+                    if err.status == 401:
+                        raise ConfigEntryAuthFailed("DiapStash token expired") from err
+                    _LOGGER.debug("Could not fetch type %d (HTTP %d); will retry", type_id, err.status)
+                    continue
+                except Exception:
+                    _LOGGER.debug("Could not fetch type %d; will retry next poll", type_id)
+                    continue
 
-            try:
-                pub_names, pub_timgs, pub_vimgs = await self._client.get_diaper_types()
-                merged.update(pub_names)
-                merged_type_images.update(pub_timgs)
-                merged_variant_images.update(pub_vimgs)
-            except Exception as err:
-                _LOGGER.warning("Failed to fetch public diaper types: %s", err)
-                merged.update(self._cached_diaper_types)
-                merged_type_images.update(self._cached_diaper_type_images)
-                merged_variant_images.update(self._cached_diaper_variant_images)
-
-            try:
-                # Custom types merged after public so they take precedence on ID collision.
-                cust_names, cust_timgs, cust_vimgs = await self._client.get_custom_diaper_types()
-                merged.update(cust_names)
-                merged_type_images.update(cust_timgs)
-                merged_variant_images.update(cust_vimgs)
-            except Exception as err:
-                _LOGGER.warning("Failed to fetch custom diaper types: %s", err)
-
-            if merged:
-                self._cached_diaper_types = merged
-            if merged_type_images:
-                self._cached_diaper_type_images = merged_type_images
-            if merged_variant_images:
-                self._cached_diaper_variant_images = merged_variant_images
+                if type_obj:
+                    self._cached_diaper_types[type_id] = type_obj.get("name", str(type_id))
+                    pi = type_obj.get("primaryImage") or {}
+                    if pi.get("url"):
+                        self._cached_diaper_type_images[type_id] = pi["url"]
+                    for v in type_obj.get("variants") or []:
+                        vpi = v.get("primaryImage") or {}
+                        if v.get("id") and vpi.get("url"):
+                            self._cached_diaper_variant_images[str(v["id"])] = vpi["url"]
+                else:
+                    # 404 from both endpoints — store raw id string to prevent retries.
+                    self._cached_diaper_types[type_id] = str(type_id)
 
         return {
             "current_change": current_change,

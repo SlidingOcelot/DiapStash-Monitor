@@ -4,6 +4,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import aiohttp
+
 from homeassistant.helpers import config_entry_oauth2_flow
 
 from .const import API_BASE_URL
@@ -145,61 +147,32 @@ class DiapStashApiClient:
         accidents = data.get("data", [])
         return accidents[0] if accidents else None
 
-    async def get_diaper_types(self) -> tuple[dict[int, str], dict[int, str], dict[str, str]]:
-        """Return (names, type_images, variant_images) from the public type catalogue.
+    async def get_diaper_type(self, type_id: int) -> dict[str, Any] | None:
+        """Fetch a single type from the public catalogue by ID.
 
-        The public endpoint requires no authentication. Each type object includes
-        primaryImage.url and a variants list, each variant having its own primaryImage.
-        Keys are normalised to int (typeId) or str (variantId) to match the coordinator
-        cache types and the ChangeDiaper object's typeId / variantId fields.
+        Returns the type object (the value of the 'type' key in the response) or None
+        when the server returns 404 (type does not exist in the public catalogue).
+        All other errors propagate so the coordinator can handle them.
         """
-        data = await self._get("/api/v1/type/types", params={"size": 200})
-        items = data.get("data", [])
-        _LOGGER.warning("DiapStash public types: %d items, keys=%s", len(items), list(data.keys()))
-        if items:
-            _LOGGER.warning("DiapStash sample type item keys: %s", list(items[0].keys()))
-        names: dict[int, str] = {}
-        type_images: dict[int, str] = {}
-        variant_images: dict[str, str] = {}
-        for t in items:
-            tid = int(t["id"])
-            names[tid] = t.get("name", str(tid))
-            pi = t.get("primaryImage") or {}
-            if pi.get("url"):
-                type_images[tid] = pi["url"]
-            for v in t.get("variants") or []:
-                vpi = v.get("primaryImage") or {}
-                if v.get("id") and vpi.get("url"):
-                    variant_images[str(v["id"])] = vpi["url"]
-        if items:
-            _LOGGER.warning(
-                "DiapStash type sample — id=%r name=%r primaryImage=%r",
-                items[0].get("id"), items[0].get("name"), items[0].get("primaryImage"),
-            )
-        _LOGGER.warning(
-            "DiapStash type parse result: %d names, %d type images, %d variant images",
-            len(names), len(type_images), len(variant_images),
-        )
-        return names, type_images, variant_images
+        try:
+            data = await self._get(f"/api/v1/type/types/{type_id}")
+            return data.get("type")
+        except aiohttp.ClientResponseError as err:
+            if err.status == 404:
+                return None
+            raise
 
-    async def get_custom_diaper_types(self) -> tuple[dict[int, str], dict[int, str], dict[str, str]]:
-        """Return (names, type_images, variant_images) for user-defined types.
+    async def get_custom_diaper_type(self, type_id: int) -> dict[str, Any] | None:
+        """Fetch a single user-defined type by ID.
 
-        Custom types take precedence over public catalogue entries on ID collision
-        when the coordinator merges both sets. Same return structure as get_diaper_types().
+        Returns the type object or None on 404. Called as a fallback when the public
+        catalogue returns 404, indicating the type is user-created rather than from
+        the shared DiapStash catalogue.
         """
-        data = await self._get("/api/v1/type/types/custom", params={"size": 200})
-        names: dict[int, str] = {}
-        type_images: dict[int, str] = {}
-        variant_images: dict[str, str] = {}
-        for t in data.get("data", []):
-            tid = int(t["id"])
-            names[tid] = t.get("name", str(tid))
-            pi = t.get("primaryImage") or {}
-            if pi.get("url"):
-                type_images[tid] = pi["url"]
-            for v in t.get("variants") or []:
-                vpi = v.get("primaryImage") or {}
-                if v.get("id") and vpi.get("url"):
-                    variant_images[str(v["id"])] = vpi["url"]
-        return names, type_images, variant_images
+        try:
+            data = await self._get(f"/api/v1/type/types/custom/{type_id}")
+            return data.get("type")
+        except aiohttp.ClientResponseError as err:
+            if err.status == 404:
+                return None
+            raise
