@@ -19,6 +19,12 @@ OAUTH_TOKEN_URL = "https://account.diapstash.com/oidc/token"
 # in the authorisation request.
 SCOPES = ["offline_access", "cloud-sync.history", "cloud-sync.types"]
 
+# Accident location value for toilet-training visits.
+# When an accident is logged with this location it means the toilet was used
+# (intentionally or not) rather than soiling the diaper. Such accidents are excluded
+# from accidents_for_change so they do not inflate diaper-state sensors or counts.
+ACCIDENT_LOCATION_TOILET = "toilet"
+
 DEFAULT_SCAN_INTERVAL = 5   # minutes
 # Rate limit budget: 120 req/hr ÷ 3 API calls per poll (types cached) = 40 polls/hr max.
 # 40 polls/hr = one poll every 1.5 min, so a 1-minute floor still keeps us within budget.

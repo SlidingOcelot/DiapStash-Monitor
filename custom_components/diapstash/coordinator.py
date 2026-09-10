@@ -11,7 +11,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import DiapStashApiClient, DiapStashRateLimitError, _parse_ratelimit_header
-from .const import DEFAULT_SCAN_INTERVAL, DOMAIN, MIN_SCAN_INTERVAL
+from .const import ACCIDENT_LOCATION_TOILET, DEFAULT_SCAN_INTERVAL, DOMAIN, MIN_SCAN_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -56,15 +56,10 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._client = client
 
-        # typeId → display name cache. Populated on first successful poll and reused
-        # on subsequent polls to avoid fetching the type catalogue every 5 minutes.
+        # typeId → display name cache. Refreshed on startup and once per hour
+        # (every _TYPE_REFRESH_POLLS polls at the default 5-min interval).
         self._cached_diaper_types: dict[int, str] = {}
-
-        # Tracks typeIds that were already tried and not found in any catalogue.
-        # Prevents an infinite re-fetch loop when a typeId is genuinely absent:
-        # on first miss we clear the cache for one re-fetch; after that second miss
-        # the id is added here and no further cache clears are triggered for it.
-        self._cache_miss_ids: set[int] = set()
+        self._type_poll_count: int = 0
 
     async def _async_update_data(self) -> dict[str, Any]:
         # Heal any prior rate-limit backoff at the start of each successful cycle.
@@ -125,7 +120,7 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # --- Step 1: Active change ---
         # A change is considered active when its endTime is null.
-        # Returns None when the child is between changes (not wearing a diaper).
+        # Returns None when no change is active (not wearing a diaper).
         try:
             current_change = await self._client.get_current_change()
         except aiohttp.ClientResponseError as err:
@@ -151,6 +146,12 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         change_start = _parse_utc((current_change or {}).get("startTime"))
 
         for a in all_accidents:
+            # Toilet accidents represent toilet-training visits, not diaper soiling.
+            # Exclude them from both lists so they don't influence diaper state,
+            # accident counts, peak levels, or outside-change automations.
+            if a.get("location") == ACCIDENT_LOCATION_TOILET:
+                continue
+
             linked = a.get("linkedChangeId")
 
             if linked is not None:
@@ -192,38 +193,32 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise
 
         # --- Step 4: Diaper type cache ---
-        # The type catalogue (public + custom) is fetched once and reused.
-        # Re-fetched when the cache is empty, which happens in two cases:
-        #   a) First poll after startup.
-        #   b) A cache miss was detected on the previous poll (see below).
-        if not self._cached_diaper_types:
-            try:
-                diaper_types: dict[int, str] = await self._client.get_diaper_types()
-                custom_types = await self._client.get_custom_diaper_types()
-                # Custom types take precedence over public catalogue entries with the same id.
-                diaper_types.update(custom_types)
-                self._cached_diaper_types = diaper_types
-                self._cache_miss_ids.clear()
-            except Exception:
-                _LOGGER.debug("Failed to fetch diaper types; names will fall back to type IDs")
+        # Refresh the type catalogue on startup and then once per hour.
+        # At the default 5-min scan interval, 12 polls ≈ 1 hour.
+        # Public and custom types are fetched in separate try/except blocks so a
+        # failure in one does not prevent the other from loading.
+        # IDs are normalised to int because JSON parsers on some runtimes may return
+        # them as strings, and a str/int mismatch in dict lookup silently falls through.
+        _TYPE_REFRESH_POLLS = 12
+        self._type_poll_count += 1
+        if not self._cached_diaper_types or self._type_poll_count >= _TYPE_REFRESH_POLLS:
+            self._type_poll_count = 0
+            merged: dict[int, str] = {}
 
-        # Cache miss detection: if the currently-worn diaper has a typeId that is not
-        # in the cache (e.g. a custom type added after the last restart), clear the
-        # cache so it re-fetches on the very next poll.
-        # _cache_miss_ids prevents an infinite clear→re-fetch→miss loop when a typeId
-        # is genuinely absent from all catalogues — after one re-fetch attempt the id
-        # is recorded here and no further cache clears are triggered for it.
-        diapers = (current_change or {}).get("diapers") or []
-        used_ids = {d.get("typeId") for d in diapers if d.get("typeId") is not None}
-        missing_ids = used_ids - set(self._cached_diaper_types.keys())
-        new_missing = missing_ids - self._cache_miss_ids
-        if new_missing and self._cached_diaper_types:
-            _LOGGER.debug(
-                "DiapStash: typeId(s) %s not in type cache — clearing for re-fetch next poll",
-                new_missing,
-            )
-            self._cache_miss_ids.update(new_missing)
-            self._cached_diaper_types = {}  # triggers re-fetch on the next poll cycle
+            try:
+                merged.update(await self._client.get_diaper_types())
+            except Exception:
+                _LOGGER.debug("Failed to fetch public diaper types; retaining cached names")
+                merged.update(self._cached_diaper_types)  # keep what we have
+
+            try:
+                # Custom types merged after public so they take precedence on ID collision.
+                merged.update(await self._client.get_custom_diaper_types())
+            except Exception:
+                _LOGGER.debug("Failed to fetch custom diaper types")
+
+            if merged:
+                self._cached_diaper_types = merged
 
         return {
             "current_change": current_change,

@@ -148,7 +148,7 @@ class DiapStashApiClient:
     async def get_diaper_types(self) -> dict[int, str]:
         """Return a mapping of typeId → display name from the public type catalogue."""
         data = await self._get("/api/v1/type/types", params={"size": 200})
-        return {t["id"]: t.get("name", str(t["id"])) for t in data.get("data", [])}
+        return {int(t["id"]): t.get("name", str(t["id"])) for t in data.get("data", [])}
 
     async def get_custom_diaper_types(self) -> dict[int, str]:
         """Return user-defined types (merged on top of catalogue types by the coordinator).
@@ -157,4 +157,4 @@ class DiapStashApiClient:
         when the coordinator calls dict.update(custom_types) after fetching both.
         """
         data = await self._get("/api/v1/type/types/custom", params={"size": 200})
-        return {t["id"]: t.get("name", str(t["id"])) for t in data.get("data", [])}
+        return {int(t["id"]): t.get("name", str(t["id"])) for t in data.get("data", [])}

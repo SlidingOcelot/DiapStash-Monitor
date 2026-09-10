@@ -85,7 +85,7 @@ class CurrentDiaperSensor(_DiapStashEntity, SensorEntity):
     """
 
     _attr_name = "Current Diaper"
-    _attr_icon = "mdi:baby"
+    _attr_icon = "mdi:account"
 
     def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator, entry, "current_diaper")
@@ -102,11 +102,16 @@ class CurrentDiaperSensor(_DiapStashEntity, SensorEntity):
 
         type_map: dict[int, str] = self.coordinator.data.get("diaper_types", {})
         # Sort by the 'order' field so stacked diapers are listed consistently.
-        # Fall back to the raw typeId string when the name is not yet cached.
-        names = [
-            type_map.get(d.get("typeId"), str(d.get("typeId", "unknown")))
-            for d in sorted(diapers, key=lambda d: d.get("order", 0))
-        ]
+        # Normalise typeId to int before lookup — the JSON parser may return it as a
+        # string on some runtimes, causing a silent miss against the int-keyed cache.
+        names = []
+        for d in sorted(diapers, key=lambda d: d.get("order", 0)):
+            raw_id = d.get("typeId")
+            try:
+                type_id = int(raw_id)
+            except (TypeError, ValueError):
+                type_id = raw_id
+            names.append(type_map.get(type_id, str(raw_id)))
         return ", ".join(names)
 
     @property
@@ -386,7 +391,7 @@ class LastOutsideAccidentSensor(_DiapStashEntity, SensorEntity):
 
     'Outside' means: the accident has no linkedChangeId AND its timestamp predates
     the current change's startTime (or there is no current change). These are bare
-    accidents — the child was not wearing a diaper when they happened.
+    accidents — no diaper was being worn when they happened.
 
     Primary state is the accident type ("wetting" or "mess"), intended as an
     automation trigger. All accident fields are exposed as attributes so automations
