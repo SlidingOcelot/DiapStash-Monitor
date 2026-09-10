@@ -154,10 +154,12 @@ class DiapStashApiClient:
         cache types and the ChangeDiaper object's typeId / variantId fields.
         """
         data = await self._get("/api/v1/type/types", params={"size": 200})
+        items = data.get("data", [])
+        _LOGGER.warning("DiapStash public types: %d items, keys=%s", len(items), list(data.keys()))
         names: dict[int, str] = {}
         type_images: dict[int, str] = {}
         variant_images: dict[str, str] = {}
-        for t in data.get("data", []):
+        for t in items:
             tid = int(t["id"])
             names[tid] = t.get("name", str(tid))
             pi = t.get("primaryImage") or {}
