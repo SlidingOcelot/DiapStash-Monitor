@@ -214,8 +214,8 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 merged.update(pub_names)
                 merged_type_images.update(pub_timgs)
                 merged_variant_images.update(pub_vimgs)
-            except Exception:
-                _LOGGER.debug("Failed to fetch public diaper types; retaining cached names")
+            except Exception as err:
+                _LOGGER.warning("Failed to fetch public diaper types: %s", err)
                 merged.update(self._cached_diaper_types)
                 merged_type_images.update(self._cached_diaper_type_images)
                 merged_variant_images.update(self._cached_diaper_variant_images)
@@ -226,8 +226,8 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 merged.update(cust_names)
                 merged_type_images.update(cust_timgs)
                 merged_variant_images.update(cust_vimgs)
-            except Exception:
-                _LOGGER.debug("Failed to fetch custom diaper types")
+            except Exception as err:
+                _LOGGER.warning("Failed to fetch custom diaper types: %s", err)
 
             if merged:
                 self._cached_diaper_types = merged
