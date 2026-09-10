@@ -156,6 +156,8 @@ class DiapStashApiClient:
         data = await self._get("/api/v1/type/types", params={"size": 200})
         items = data.get("data", [])
         _LOGGER.warning("DiapStash public types: %d items, keys=%s", len(items), list(data.keys()))
+        if items:
+            _LOGGER.warning("DiapStash sample type item keys: %s", list(items[0].keys()))
         names: dict[int, str] = {}
         type_images: dict[int, str] = {}
         variant_images: dict[str, str] = {}
