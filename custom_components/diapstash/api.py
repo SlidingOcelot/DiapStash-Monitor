@@ -145,16 +145,48 @@ class DiapStashApiClient:
         accidents = data.get("data", [])
         return accidents[0] if accidents else None
 
-    async def get_diaper_types(self) -> dict[int, str]:
-        """Return a mapping of typeId → display name from the public type catalogue."""
+    async def get_diaper_types(self) -> tuple[dict[int, str], dict[int, str], dict[str, str]]:
+        """Return (names, type_images, variant_images) from the public type catalogue.
+
+        The public endpoint requires no authentication. Each type object includes
+        primaryImage.url and a variants list, each variant having its own primaryImage.
+        Keys are normalised to int (typeId) or str (variantId) to match the coordinator
+        cache types and the ChangeDiaper object's typeId / variantId fields.
+        """
         data = await self._get("/api/v1/type/types", params={"size": 200})
-        return {int(t["id"]): t.get("name", str(t["id"])) for t in data.get("data", [])}
+        names: dict[int, str] = {}
+        type_images: dict[int, str] = {}
+        variant_images: dict[str, str] = {}
+        for t in data.get("data", []):
+            tid = int(t["id"])
+            names[tid] = t.get("name", str(tid))
+            pi = t.get("primaryImage") or {}
+            if pi.get("url"):
+                type_images[tid] = pi["url"]
+            for v in t.get("variants") or []:
+                vpi = v.get("primaryImage") or {}
+                if v.get("id") and vpi.get("url"):
+                    variant_images[str(v["id"])] = vpi["url"]
+        return names, type_images, variant_images
 
-    async def get_custom_diaper_types(self) -> dict[int, str]:
-        """Return user-defined types (merged on top of catalogue types by the coordinator).
+    async def get_custom_diaper_types(self) -> tuple[dict[int, str], dict[int, str], dict[str, str]]:
+        """Return (names, type_images, variant_images) for user-defined types.
 
-        Custom types take precedence over public catalogue entries with the same id
-        when the coordinator calls dict.update(custom_types) after fetching both.
+        Custom types take precedence over public catalogue entries on ID collision
+        when the coordinator merges both sets. Same return structure as get_diaper_types().
         """
         data = await self._get("/api/v1/type/types/custom", params={"size": 200})
-        return {int(t["id"]): t.get("name", str(t["id"])) for t in data.get("data", [])}
+        names: dict[int, str] = {}
+        type_images: dict[int, str] = {}
+        variant_images: dict[str, str] = {}
+        for t in data.get("data", []):
+            tid = int(t["id"])
+            names[tid] = t.get("name", str(tid))
+            pi = t.get("primaryImage") or {}
+            if pi.get("url"):
+                type_images[tid] = pi["url"]
+            for v in t.get("variants") or []:
+                vpi = v.get("primaryImage") or {}
+                if v.get("id") and vpi.get("url"):
+                    variant_images[str(v["id"])] = vpi["url"]
+        return names, type_images, variant_images

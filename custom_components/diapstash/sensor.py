@@ -119,12 +119,39 @@ class CurrentDiaperSensor(_DiapStashEntity, SensorEntity):
         current_change: dict[str, Any] | None = self.coordinator.data.get("current_change")
         if current_change is None:
             return {}
+
+        type_imgs: dict[int, str] = self.coordinator.data.get("diaper_type_images", {})
+        variant_imgs: dict[str, str] = self.coordinator.data.get("diaper_variant_images", {})
+        diapers = sorted(
+            current_change.get("diapers") or [],
+            key=lambda d: d.get("order", 0),
+        )
+
+        # Build an ordered list of image URLs — one per diaper slot that has a catalog
+        # image. Variant image takes priority over type image when both are available.
+        image_urls: list[str] = []
+        for d in diapers:
+            vid = d.get("variantId")
+            if vid and str(vid) in variant_imgs:
+                image_urls.append(variant_imgs[str(vid)])
+                continue
+            try:
+                tid = int(d.get("typeId"))
+            except (TypeError, ValueError):
+                continue
+            img = type_imgs.get(tid)
+            if img:
+                image_urls.append(img)
+
         return {
             "change_id": current_change.get("id"),
             "start_time": current_change.get("startTime"),
             "change_period": current_change.get("changePeriod"),
             "note": current_change.get("note"),
             "tags": current_change.get("tags"),
+            "diaper_count": len(diapers),
+            "image_url": image_urls[0] if image_urls else None,
+            "image_urls": image_urls,
         }
 
 

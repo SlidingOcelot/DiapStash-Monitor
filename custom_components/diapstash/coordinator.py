@@ -56,9 +56,11 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self._client = client
 
-        # typeId → display name cache. Refreshed on startup and once per hour
-        # (every _TYPE_REFRESH_POLLS polls at the default 5-min interval).
+        # typeId → display name / image URL caches.
+        # Refreshed on startup and once per hour (every _TYPE_REFRESH_POLLS polls).
         self._cached_diaper_types: dict[int, str] = {}
+        self._cached_diaper_type_images: dict[int, str] = {}
+        self._cached_diaper_variant_images: dict[str, str] = {}
         self._type_poll_count: int = 0
 
     async def _async_update_data(self) -> dict[str, Any]:
@@ -204,21 +206,35 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self._cached_diaper_types or self._type_poll_count >= _TYPE_REFRESH_POLLS:
             self._type_poll_count = 0
             merged: dict[int, str] = {}
+            merged_type_images: dict[int, str] = {}
+            merged_variant_images: dict[str, str] = {}
 
             try:
-                merged.update(await self._client.get_diaper_types())
+                pub_names, pub_timgs, pub_vimgs = await self._client.get_diaper_types()
+                merged.update(pub_names)
+                merged_type_images.update(pub_timgs)
+                merged_variant_images.update(pub_vimgs)
             except Exception:
                 _LOGGER.debug("Failed to fetch public diaper types; retaining cached names")
-                merged.update(self._cached_diaper_types)  # keep what we have
+                merged.update(self._cached_diaper_types)
+                merged_type_images.update(self._cached_diaper_type_images)
+                merged_variant_images.update(self._cached_diaper_variant_images)
 
             try:
                 # Custom types merged after public so they take precedence on ID collision.
-                merged.update(await self._client.get_custom_diaper_types())
+                cust_names, cust_timgs, cust_vimgs = await self._client.get_custom_diaper_types()
+                merged.update(cust_names)
+                merged_type_images.update(cust_timgs)
+                merged_variant_images.update(cust_vimgs)
             except Exception:
                 _LOGGER.debug("Failed to fetch custom diaper types")
 
             if merged:
                 self._cached_diaper_types = merged
+            if merged_type_images:
+                self._cached_diaper_type_images = merged_type_images
+            if merged_variant_images:
+                self._cached_diaper_variant_images = merged_variant_images
 
         return {
             "current_change": current_change,
@@ -226,4 +242,6 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "accidents_outside_change": accidents_outside_change,
             "last_accident": last_accident,
             "diaper_types": self._cached_diaper_types,
+            "diaper_type_images": self._cached_diaper_type_images,
+            "diaper_variant_images": self._cached_diaper_variant_images,
         }
