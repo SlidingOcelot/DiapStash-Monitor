@@ -130,6 +130,11 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise ConfigEntryAuthFailed("DiapStash token expired") from err
             raise
 
+        # Diagnostic: log what the active change's diapers look like so we can
+        # compare typeId values against the catalogue keys.
+        if current_change:
+            _LOGGER.warning("DiapStash current change diapers: %s", current_change.get("diapers"))
+
         # --- Step 2: Accident partitioning ---
         # Accidents are always fetched, regardless of whether a change is active.
         # This is needed to populate accidents_outside_change when not wearing.

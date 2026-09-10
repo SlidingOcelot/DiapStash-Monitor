@@ -171,6 +171,15 @@ class DiapStashApiClient:
                 vpi = v.get("primaryImage") or {}
                 if v.get("id") and vpi.get("url"):
                     variant_images[str(v["id"])] = vpi["url"]
+        if items:
+            _LOGGER.warning(
+                "DiapStash type sample — id=%r name=%r primaryImage=%r",
+                items[0].get("id"), items[0].get("name"), items[0].get("primaryImage"),
+            )
+        _LOGGER.warning(
+            "DiapStash type parse result: %d names, %d type images, %d variant images",
+            len(names), len(type_images), len(variant_images),
+        )
         return names, type_images, variant_images
 
     async def get_custom_diaper_types(self) -> tuple[dict[int, str], dict[int, str], dict[str, str]]:
