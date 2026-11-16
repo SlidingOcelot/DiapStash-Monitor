@@ -6,7 +6,7 @@
       },
       "reauth_confirm": {
         "title": "Re-authorize DiapStash",
-        "description": "Your DiapStash authorization has expired (refresh tokens have a 14-day lifetime). Click Submit to open the DiapStash login page and issue a new token."
+        "description": "Your DiapStash authorization has expired or is missing a permission (refresh tokens last 7 days without use). Make sure the scopes cloud-sync.history, cloud-sync.accidents and cloud-sync.types are enabled on your DiapStash API client, then click Submit to open the DiapStash login page and issue a new token."
       }
     },
     "abort": {
@@ -21,6 +21,17 @@
     },
     "create_entry": {
       "default": "Successfully authenticated with DiapStash."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "DiapStash options",
+        "description": "How often to poll DiapStash. Each update uses 2 of the 120 API requests per hour; if the remaining quota runs low, updates are slowed down automatically.",
+        "data": {
+          "scan_interval": "Update interval (minutes)"
+        }
+      }
     }
   }
 }

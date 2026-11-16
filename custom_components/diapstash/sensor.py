@@ -1,27 +1,30 @@
 """DiapStash sensor platform."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EntityCategory, UnitOfTime
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN
-# _parse_utc is shared with coordinator — imported here to avoid duplicating
-# the ISO-8601 / 'Z' → '+00:00' workaround in multiple places.
-from .coordinator import DiapStashCoordinator, _parse_utc
+from .const import ACCIDENT_LOCATION_TOILET, DOMAIN, HISTORY_LENGTH
+from .coordinator import DiapStashCoordinator, _parse_utc, accident_summary
 
-# Human-readable state strings for DiaperStateSensor. Defined as module constants
-# so they can be referenced in both the sensor and the icon lookup table.
+# Human-readable state strings for DiaperStateSensor.
 _STATE_NOT_WEARING = "not wearing"
 _STATE_DRY = "Dry"
 _STATE_WET = "Wet"
 _STATE_MESSY = "Messy"
 _STATE_WET_MESSY = "Wet & Messy"
+
+# Timezone-aware sentinel for sorting accidents whose 'when' is missing or unparseable.
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
 
 
 async def async_setup_entry(
@@ -31,33 +34,54 @@ async def async_setup_entry(
 ) -> None:
     """Set up DiapStash sensors from a config entry.
 
-    Binary sensors (Leak, Messy Overflow) are registered in binary_sensor.py
-    because they extend BinarySensorEntity and require a separate platform setup.
+    Binary sensors (Leak, Messy Overflow) are registered in binary_sensor.py.
     """
     coordinator: DiapStashCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
         [
             CurrentDiaperSensor(coordinator, entry),
             DiaperStateSensor(coordinator, entry),
+            ChangeStartedSensor(coordinator, entry),
+            TimeInDiaperSensor(coordinator, entry),
+            ChangeAccidentsSensor(coordinator, entry),
             WetAccidentCountSensor(coordinator, entry),
             MessyAccidentCountSensor(coordinator, entry),
-            LastAccidentSensor(coordinator, entry),
             PeakWetnessLevelSensor(coordinator, entry),
             PeakMessyLevelSensor(coordinator, entry),
             LastWettingTimeSensor(coordinator, entry),
             LastMessTimeSensor(coordinator, entry),
+            LastAccidentSensor(coordinator, entry),
             LastOutsideAccidentSensor(coordinator, entry),
+            AccidentsTodaySensor(coordinator, entry),
+            AccidentsWeekSensor(coordinator, entry),
+            ApiQuotaSensor(coordinator, entry),
         ]
     )
+
+
+def _when(accident: dict[str, Any]) -> datetime:
+    return _parse_utc(accident.get("when")) or _EPOCH
+
+
+def _minutes_between(start: datetime | None, end: datetime | None) -> int | None:
+    if start is None or end is None:
+        return None
+    return int((end - start).total_seconds() // 60)
+
+
+def _type_counts(accidents: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "wetting": sum(1 for a in accidents if a.get("type") == "wetting"),
+        "mess": sum(1 for a in accidents if a.get("type") == "mess"),
+    }
 
 
 class _DiapStashEntity(CoordinatorEntity[DiapStashCoordinator]):
     """Shared base for all DiapStash entities.
 
-    Wires the unique_id (entry_id + per-sensor key) and device_info so every
-    entity appears under the same "DiapStash" device in the HA device registry.
-    Using entry_id as the unique_id prefix means entities survive credential
-    re-authorisation as long as the config entry itself is not recreated.
+    unique_id is entry_id + per-sensor key, and every entity is grouped under one
+    "DiapStash" device. Entities survive re-authorisation because the config entry
+    is kept.
     """
 
     _attr_has_entity_name = True
@@ -72,16 +96,44 @@ class _DiapStashEntity(CoordinatorEntity[DiapStashCoordinator]):
             "entry_type": "service",
         }
 
+    @property
+    def _current_change(self) -> dict[str, Any] | None:
+        return self.coordinator.data.get("current_change")
+
+    @property
+    def _change_accidents(self) -> list[dict[str, Any]]:
+        """Accidents of the current change (toilet visits excluded), newest first."""
+        return self.coordinator.data.get("accidents_for_change", [])
+
+
+class _MinuteTickEntity(_DiapStashEntity):
+    """Entity whose value depends on the current time.
+
+    Rewrites its state every minute between polls (no API calls), so durations,
+    "today" counts and "minutes since" attributes stay current even with a long
+    update interval.
+    """
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+
+        @callback
+        def _tick(_now: datetime) -> None:
+            self.async_write_ha_state()
+
+        self.async_on_remove(
+            async_track_time_interval(self.hass, _tick, timedelta(minutes=1))
+        )
+
+
+# --- Current change ---------------------------------------------------------------
+
 
 class CurrentDiaperSensor(_DiapStashEntity, SensorEntity):
-    """Shows the diaper type(s) currently being worn, or 'not wearing'.
+    """Diaper type(s) currently being worn, or 'not wearing'.
 
-    Resolves typeIds from the coordinator's cached type catalogue. If a typeId
-    is not yet in the cache (e.g. a newly created custom type), it falls back to
-    the raw integer string. The coordinator will detect the miss and refresh the
-    cache on the next poll so the name resolves within two poll cycles.
-    Multiple diapers (stacked) are displayed in their configured 'order' and
-    joined with a comma.
+    Names and pictures come inline with the latest change. Stacked diapers are
+    listed in wearing order, comma-separated.
     """
 
     _attr_name = "Current Diaper"
@@ -92,71 +144,33 @@ class CurrentDiaperSensor(_DiapStashEntity, SensorEntity):
 
     @property
     def native_value(self) -> str:
-        current_change: dict[str, Any] | None = self.coordinator.data.get("current_change")
-        if current_change is None:
+        if self._current_change is None:
             return _STATE_NOT_WEARING
-
-        diapers: list[dict[str, Any]] = current_change.get("diapers") or []
+        diapers = self.coordinator.data.get("diapers") or []
         if not diapers:
             return "unknown"
-
-        type_map: dict[int, str] = self.coordinator.data.get("diaper_types", {})
-        # Sort by the 'order' field so stacked diapers are listed consistently.
-        # Normalise typeId to int before lookup — the JSON parser may return it as a
-        # string on some runtimes, causing a silent miss against the int-keyed cache.
-        names = []
-        for d in sorted(diapers, key=lambda d: d.get("order", 0)):
-            raw_id = d.get("typeId")
-            try:
-                type_id = int(raw_id)
-            except (TypeError, ValueError):
-                type_id = raw_id
-            names.append(type_map.get(type_id, str(raw_id)))
-        return ", ".join(names)
+        return ", ".join(d["name"] for d in diapers)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        current_change: dict[str, Any] | None = self.coordinator.data.get("current_change")
-        if current_change is None:
+        change = self._current_change
+        if change is None:
             return {}
-
-        type_imgs: dict[int, str] = self.coordinator.data.get("diaper_type_images", {})
-        variant_imgs: dict[str, str] = self.coordinator.data.get("diaper_variant_images", {})
-        diapers = sorted(
-            current_change.get("diapers") or [],
-            key=lambda d: d.get("order", 0),
-        )
-
-        # Build an ordered list of image URLs — one per diaper slot that has a catalog
-        # image. Variant image takes priority over type image when both are available.
-        image_urls: list[str] = []
-        for d in diapers:
-            vid = d.get("variantId")
-            if vid and str(vid) in variant_imgs:
-                image_urls.append(variant_imgs[str(vid)])
-                continue
-            try:
-                tid = int(d.get("typeId"))
-            except (TypeError, ValueError):
-                continue
-            img = type_imgs.get(tid)
-            if img:
-                image_urls.append(img)
-
+        diapers = self.coordinator.data.get("diapers") or []
+        image_urls = [d["image_url"] for d in diapers if d.get("image_url")]
         return {
-            "change_id": current_change.get("id"),
-            "start_time": current_change.get("startTime"),
-            "change_period": current_change.get("changePeriod"),
-            "note": current_change.get("note"),
-            "tags": current_change.get("tags"),
+            "change_id": change.get("id"),
+            "start_time": change.get("startTime"),
+            "change_period": change.get("changePeriod"),
+            "note": change.get("note"),
+            "tags": change.get("tags"),
             "diaper_count": len(diapers),
+            "diapers": diapers,
             "image_url": image_urls[0] if image_urls else None,
             "image_urls": image_urls,
         }
 
 
-# Per-state icons for DiaperStateSensor. Keyed by the same strings returned by
-# native_value so the dynamic icon property can look them up without conditionals.
 _DIAPER_STATE_ICONS: dict[str | None, str] = {
     _STATE_DRY: "mdi:emoticon-happy-outline",
     _STATE_WET: "mdi:water",
@@ -169,11 +183,8 @@ _DIAPER_STATE_ICONS: dict[str | None, str] = {
 class DiaperStateSensor(_DiapStashEntity, SensorEntity):
     """Diaper state (Dry / Wet / Messy / Wet & Messy) derived from accidents.
 
-    We compute this ourselves rather than reading change.state from the API because
-    the server only updates that field when the change is closed or when the user
-    manually sets it. During an active change it remains stale. Computing from
-    accidents_for_change gives a real-time view as soon as accidents are logged.
-    Returns None (→ "unavailable") when no change is active.
+    The server only updates change.state when a change is closed or edited, so the
+    state is computed from the accidents logged during the change instead.
     """
 
     _attr_name = "Diaper State"
@@ -187,81 +198,232 @@ class DiaperStateSensor(_DiapStashEntity, SensorEntity):
 
     @property
     def native_value(self) -> str | None:
-        current_change: dict[str, Any] | None = self.coordinator.data.get("current_change")
-        if current_change is None:
-            return None  # renders as "unavailable" in HA
-
-        accidents: list[dict[str, Any]] = self.coordinator.data.get("accidents_for_change", [])
-        has_wet = any(a.get("type") == "wetting" for a in accidents)
-        has_messy = any(a.get("type") == "mess" for a in accidents)
-
-        if has_wet and has_messy:
+        if self._current_change is None:
+            return None
+        counts = _type_counts(self._change_accidents)
+        if counts["wetting"] and counts["mess"]:
             return _STATE_WET_MESSY
-        if has_wet:
+        if counts["wetting"]:
             return _STATE_WET
-        if has_messy:
+        if counts["mess"]:
             return _STATE_MESSY
         return _STATE_DRY
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        accidents: list[dict[str, Any]] = self.coordinator.data.get("accidents_for_change", [])
-        return {"accident_count": len(accidents)}
+        return {"accident_count": len(self._change_accidents)}
 
 
-class WetAccidentCountSensor(_DiapStashEntity, SensorEntity):
-    """Count of wetting accidents in the current change.
+class ChangeStartedSensor(_DiapStashEntity, SensorEntity):
+    """When the current diaper was put on. Shown as relative time in the UI."""
 
-    Returns None (→ "unavailable") when not wearing, so automations can distinguish
-    "zero accidents during an active change" from "no change in progress".
-    state_class="total" allows HA to track the value over time in statistics.
+    _attr_name = "Change Started"
+    _attr_icon = "mdi:clock-start"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "change_started")
+
+    @property
+    def native_value(self) -> datetime | None:
+        if self._current_change is None:
+            return None
+        return _parse_utc(self._current_change.get("startTime"))
+
+
+class TimeInDiaperSensor(_MinuteTickEntity, SensorEntity):
+    """Minutes since the current diaper was put on; updates every minute.
+
+    Unknown while not wearing. Use it in automations such as "remind me after
+    4 hours" (above 240).
     """
 
-    _attr_name = "Wet Accident Count"
-    _attr_icon = "mdi:water"
+    _attr_name = "Time in Diaper"
+    _attr_icon = "mdi:timer-sand"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "time_in_diaper")
+
+    @property
+    def native_value(self) -> int | None:
+        if self._current_change is None:
+            return None
+        start = _parse_utc(self._current_change.get("startTime"))
+        minutes = _minutes_between(start, dt_util.utcnow())
+        return max(minutes, 0) if minutes is not None else None
+
+
+class ChangeAccidentsSensor(_MinuteTickEntity, SensorEntity):
+    """Number of accidents during the current change, with a timestamped list.
+
+    Attributes list every accident of the change (oldest first) plus first/last
+    times, how long the diaper stayed dry and how long since the last accident.
+    Toilet visits during the change are counted separately and not in the state.
+    """
+
+    _attr_name = "Change Accidents"
+    _attr_icon = "mdi:format-list-numbered"
+    _attr_native_unit_of_measurement = "accidents"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    # The list can be long; keep it out of the recorder database.
+    _unrecorded_attributes = frozenset({"accidents"})
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "change_accidents")
+
+    @property
+    def native_value(self) -> int | None:
+        if self._current_change is None:
+            return None
+        return len(self._change_accidents)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        change = self._current_change
+        if change is None:
+            return {}
+        accidents = sorted(self._change_accidents, key=_when)
+        start = _parse_utc(change.get("startTime"))
+        first = _parse_utc(accidents[0].get("when")) if accidents else None
+        last = _parse_utc(accidents[-1].get("when")) if accidents else None
+
+        toilet_visits = 0
+        if start is not None:
+            toilet_visits = sum(
+                1
+                for a in self.coordinator.data.get("accidents", [])
+                if a.get("location") == ACCIDENT_LOCATION_TOILET
+                and (w := _parse_utc(a.get("when"))) is not None
+                and w >= start
+            )
+
+        return {
+            **_type_counts(accidents),
+            "toilet_visits": toilet_visits,
+            "first_accident": first.isoformat() if first else None,
+            "last_accident": last.isoformat() if last else None,
+            "minutes_dry_before_first_accident": _minutes_between(start, first),
+            "minutes_since_last_accident": _minutes_between(last, dt_util.utcnow()),
+            "accidents": [accident_summary(a) for a in accidents],
+        }
+
+
+class _ChangeCountSensor(_DiapStashEntity, SensorEntity):
+    """Count of accidents of one type in the current change; unknown when not wearing."""
+
     _attr_native_unit_of_measurement = "accidents"
     _attr_state_class = "total"
+    _accident_type: str
+
+    @property
+    def native_value(self) -> int | None:
+        if self._current_change is None:
+            return None
+        return _type_counts(self._change_accidents)[self._accident_type]
+
+
+class WetAccidentCountSensor(_ChangeCountSensor):
+    _attr_name = "Wet Accident Count"
+    _attr_icon = "mdi:water"
+    _accident_type = "wetting"
 
     def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator, entry, "wet_accident_count")
 
-    @property
-    def native_value(self) -> int | None:
-        # Gate on current_change so the sensor reads "unavailable" between changes,
-        # not "0". A count of 0 would be misleading when no diaper is being worn.
-        if self.coordinator.data.get("current_change") is None:
-            return None
-        accidents: list[dict[str, Any]] = self.coordinator.data.get("accidents_for_change", [])
-        return sum(1 for a in accidents if a.get("type") == "wetting")
 
-
-class MessyAccidentCountSensor(_DiapStashEntity, SensorEntity):
-    """Count of mess accidents in the current change. See WetAccidentCountSensor for rationale."""
-
+class MessyAccidentCountSensor(_ChangeCountSensor):
     _attr_name = "Messy Accident Count"
     _attr_icon = "mdi:emoticon-poop"
-    _attr_native_unit_of_measurement = "accidents"
-    _attr_state_class = "total"
+    _accident_type = "mess"
 
     def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
         super().__init__(coordinator, entry, "messy_accident_count")
 
+
+class _PeakLevelSensor(_DiapStashEntity, SensorEntity):
+    """Highest level (0–5) of one accident type in the current change."""
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _accident_type: str
+
     @property
     def native_value(self) -> int | None:
-        if self.coordinator.data.get("current_change") is None:
+        if self._current_change is None:
             return None
-        accidents: list[dict[str, Any]] = self.coordinator.data.get("accidents_for_change", [])
-        return sum(1 for a in accidents if a.get("type") == "mess")
+        levels = [
+            a["level"]
+            for a in self._change_accidents
+            if a.get("type") == self._accident_type and a.get("level") is not None
+        ]
+        return max(levels) if levels else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        # Scale bounds for gauge cards.
+        return {"min_value": 0, "max_value": 5}
+
+
+class PeakWetnessLevelSensor(_PeakLevelSensor):
+    _attr_name = "Peak Wetness Level"
+    _attr_icon = "mdi:water-percent"
+    _accident_type = "wetting"
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "peak_wetness_level")
+
+
+class PeakMessyLevelSensor(_PeakLevelSensor):
+    _attr_name = "Peak Messy Level"
+    _attr_icon = "mdi:emoticon-poop"
+    _accident_type = "mess"
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "peak_messy_level")
+
+
+class _LastOfTypeTimeSensor(_DiapStashEntity, SensorEntity):
+    """Time of the most recent accident of one type in the current change."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _accident_type: str
+
+    @property
+    def native_value(self) -> datetime | None:
+        whens = [
+            w
+            for a in self._change_accidents
+            if a.get("type") == self._accident_type
+            and (w := _parse_utc(a.get("when"))) is not None
+        ]
+        return max(whens) if whens else None
+
+
+class LastWettingTimeSensor(_LastOfTypeTimeSensor):
+    _attr_name = "Last Wetting"
+    _attr_icon = "mdi:water-clock"
+    _accident_type = "wetting"
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "last_wetting_time")
+
+
+class LastMessTimeSensor(_LastOfTypeTimeSensor):
+    _attr_name = "Last Mess"
+    _attr_icon = "mdi:emoticon-poop-outline"
+    _accident_type = "mess"
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "last_mess_time")
+
+
+# --- Accidents overall ----------------------------------------------------------
 
 
 class LastAccidentSensor(_DiapStashEntity, SensorEntity):
-    """Global most-recent accident, regardless of change context.
-
-    This sensor reads from coordinator.data['last_accident'], which is fetched via
-    a dedicated API call (not derived from the accidents_for_change list). It shows
-    the last accident ever logged, even if it occurred during a now-closed change.
-    All accident fields are exposed as attributes to support automation triggers.
-    """
+    """Most recent accident overall, regardless of change context or location."""
 
     _attr_name = "Last Accident"
     _attr_icon = "mdi:water-alert"
@@ -271,161 +433,26 @@ class LastAccidentSensor(_DiapStashEntity, SensorEntity):
 
     @property
     def native_value(self) -> str | None:
-        accident: dict[str, Any] | None = self.coordinator.data.get("last_accident")
-        if accident is None:
-            return None
-        return accident.get("type")  # "wetting" or "mess"
+        accident = self.coordinator.data.get("last_accident")
+        return accident.get("type") if accident else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        accident: dict[str, Any] | None = self.coordinator.data.get("last_accident")
+        accident = self.coordinator.data.get("last_accident")
         if not accident:
             return {}
         return {
-            "id": accident.get("id"),
-            "when": accident.get("when"),
-            "precision_time": accident.get("precisionTime"),
-            "level": accident.get("level"),
-            "cause": accident.get("cause"),
-            "cause_leak": accident.get("causeLeak"),
-            "location": accident.get("location"),
-            "position": accident.get("position"),
-            "linked_change_id": accident.get("linkedChangeId"),
+            **accident_summary(accident),
             "created_at": accident.get("createdAt"),
             "updated_at": accident.get("updatedAt"),
         }
 
 
-class PeakWetnessLevelSensor(_DiapStashEntity, SensorEntity):
-    """Highest accident wetness level (0–5) logged in the current change.
-
-    Reports the most severe wetting accident rather than the most recent, giving a
-    better indication of overall saturation. Returns None when not wearing or when
-    no wetting accidents have been logged yet in this change.
-
-    state_class=MEASUREMENT makes HA treat this as a continuous numeric reading
-    (enables gauge cards and history graphs). min_value/max_value are exposed as
-    attributes so dashboard gauge cards can read the expected range without
-    hardcoding it in every card configuration.
-    """
-
-    _attr_name = "Peak Wetness Level"
-    _attr_icon = "mdi:water-percent"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
-        super().__init__(coordinator, entry, "peak_wetness_level")
-
-    @property
-    def native_value(self) -> int | None:
-        if self.coordinator.data.get("current_change") is None:
-            return None
-        accidents: list[dict[str, Any]] = self.coordinator.data.get("accidents_for_change", [])
-        levels = [
-            a.get("level") for a in accidents
-            if a.get("type") == "wetting" and a.get("level") is not None
-        ]
-        return max(levels) if levels else None
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        # Expose the scale bounds so gauge cards can configure themselves dynamically.
-        return {"min_value": 0, "max_value": 5}
-
-
-class PeakMessyLevelSensor(_DiapStashEntity, SensorEntity):
-    """Highest accident messy level (0–5) in the current change. See PeakWetnessLevelSensor."""
-
-    _attr_name = "Peak Messy Level"
-    _attr_icon = "mdi:emoticon-poop"
-    _attr_state_class = SensorStateClass.MEASUREMENT
-
-    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
-        super().__init__(coordinator, entry, "peak_messy_level")
-
-    @property
-    def native_value(self) -> int | None:
-        if self.coordinator.data.get("current_change") is None:
-            return None
-        accidents: list[dict[str, Any]] = self.coordinator.data.get("accidents_for_change", [])
-        levels = [
-            a.get("level") for a in accidents
-            if a.get("type") == "mess" and a.get("level") is not None
-        ]
-        return max(levels) if levels else None
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        return {"min_value": 0, "max_value": 5}
-
-
-class LastWettingTimeSensor(_DiapStashEntity, SensorEntity):
-    """Timestamp of the most recent wetting accident in the current change.
-
-    device_class=TIMESTAMP tells HA to interpret the value as a datetime and display
-    it as a relative time ("5 minutes ago") in the UI. HA requires a timezone-aware
-    datetime object — _parse_utc guarantees this by always including '+00:00'.
-    No explicit gate on current_change: when not wearing, accidents_for_change is
-    empty, so native_value naturally returns None (→ "unavailable").
-    """
-
-    _attr_name = "Last Wetting"
-    _attr_icon = "mdi:water-clock"
-    _attr_device_class = SensorDeviceClass.TIMESTAMP
-
-    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
-        super().__init__(coordinator, entry, "last_wetting_time")
-
-    @property
-    def native_value(self) -> datetime | None:
-        accidents: list[dict[str, Any]] = self.coordinator.data.get("accidents_for_change", [])
-        whens = [
-            _parse_utc(a.get("when")) for a in accidents if a.get("type") == "wetting"
-        ]
-        whens = [w for w in whens if w is not None]
-        return max(whens) if whens else None
-
-
-class LastMessTimeSensor(_DiapStashEntity, SensorEntity):
-    """Timestamp of the most recent mess accident in the current change. See LastWettingTimeSensor."""
-
-    _attr_name = "Last Mess"
-    _attr_icon = "mdi:emoticon-poop-outline"
-    _attr_device_class = SensorDeviceClass.TIMESTAMP
-
-    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
-        super().__init__(coordinator, entry, "last_mess_time")
-
-    @property
-    def native_value(self) -> datetime | None:
-        accidents: list[dict[str, Any]] = self.coordinator.data.get("accidents_for_change", [])
-        whens = [
-            _parse_utc(a.get("when")) for a in accidents if a.get("type") == "mess"
-        ]
-        whens = [w for w in whens if w is not None]
-        return max(whens) if whens else None
-
-
-# Timezone-aware sentinel for sorting accidents when 'when' is missing or unparseable.
-# datetime.min is naive by default; replace tzinfo so it compares correctly with
-# timezone-aware datetimes returned by _parse_utc. Using .min ensures any real
-# timestamp sorts after it, placing accidents with unknown times last.
-_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
-
-
 class LastOutsideAccidentSensor(_DiapStashEntity, SensorEntity):
-    """Most recent accident that occurred outside any diaper change.
+    """Most recent accident that happened while not wearing a diaper.
 
-    'Outside' means: the accident has no linkedChangeId AND its timestamp predates
-    the current change's startTime (or there is no current change). These are bare
-    accidents — no diaper was being worn when they happened.
-
-    Primary state is the accident type ("wetting" or "mess"), intended as an
-    automation trigger. All accident fields are exposed as attributes so automations
-    can branch on cause, level, location, etc. without additional template sensors.
-
-    _latest() is factored out as a helper to avoid finding the max accident twice
-    (once for native_value, once for extra_state_attributes) in the same poll cycle.
+    'Outside' means: no linkedChangeId and before the current change started (or
+    no change is active). Toilet visits are not included.
     """
 
     _attr_name = "Last Outside Accident"
@@ -435,13 +462,8 @@ class LastOutsideAccidentSensor(_DiapStashEntity, SensorEntity):
         super().__init__(coordinator, entry, "last_outside_accident")
 
     def _latest(self) -> dict[str, Any] | None:
-        """Return the most recent outside-change accident, or None if there are none."""
-        accidents: list[dict[str, Any]] = self.coordinator.data.get("accidents_outside_change", [])
-        if not accidents:
-            return None
-        # _EPOCH is used as a fallback when 'when' is missing, ensuring those accidents
-        # sort to the end rather than causing a TypeError in max().
-        return max(accidents, key=lambda a: _parse_utc(a.get("when")) or _EPOCH)
+        accidents = self.coordinator.data.get("accidents_outside_change", [])
+        return max(accidents, key=_when) if accidents else None
 
     @property
     def native_value(self) -> str | None:
@@ -451,16 +473,109 @@ class LastOutsideAccidentSensor(_DiapStashEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         accident = self._latest()
-        if not accident:
-            return {}
+        return accident_summary(accident) if accident else {}
+
+
+class _AccidentPeriodSensor(_MinuteTickEntity, SensorEntity):
+    """Accidents since a point in time (toilet visits counted separately)."""
+
+    _attr_native_unit_of_measurement = "accidents"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def _since(self) -> datetime:
+        raise NotImplementedError
+
+    def _in_period(self) -> list[dict[str, Any]]:
+        since = self._since()
+        return [
+            a
+            for a in self.coordinator.data.get("accidents", [])
+            if (w := _parse_utc(a.get("when"))) is not None and w >= since
+        ]
+
+    @property
+    def native_value(self) -> int:
+        return sum(
+            1 for a in self._in_period() if a.get("location") != ACCIDENT_LOCATION_TOILET
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        period = self._in_period()
+        not_toilet = [a for a in period if a.get("location") != ACCIDENT_LOCATION_TOILET]
         return {
-            "id": accident.get("id"),
-            "when": accident.get("when"),
-            "type": accident.get("type"),
-            "level": accident.get("level"),
-            "cause": accident.get("cause"),
-            "cause_leak": accident.get("causeLeak"),
-            "location": accident.get("location"),
-            "position": accident.get("position"),
-            "linked_change_id": accident.get("linkedChangeId"),
+            **_type_counts(not_toilet),
+            "toilet_visits": len(period) - len(not_toilet),
+            "since": self._since().isoformat(),
+        }
+
+
+class AccidentsTodaySensor(_AccidentPeriodSensor):
+    """Accidents since local midnight."""
+
+    _attr_name = "Accidents Today"
+    _attr_icon = "mdi:calendar-today"
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "accidents_today")
+
+    def _since(self) -> datetime:
+        return dt_util.start_of_local_day()
+
+
+class AccidentsWeekSensor(_AccidentPeriodSensor):
+    """Accidents in the last 7 days, with the most recent accidents as history.
+
+    The 'history' attribute lists the last HISTORY_LENGTH accidents (newest first,
+    toilet visits included) for markdown cards and templates.
+    """
+
+    _attr_name = "Accidents Last 7 Days"
+    _attr_icon = "mdi:history"
+    _unrecorded_attributes = frozenset({"history"})
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "accidents_7_days")
+
+    def _since(self) -> datetime:
+        return dt_util.utcnow() - timedelta(days=7)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        recent = self.coordinator.data.get("accidents", [])[:HISTORY_LENGTH]
+        return {
+            **super().extra_state_attributes,
+            "history": [accident_summary(a) for a in recent],
+        }
+
+
+# --- Diagnostics ----------------------------------------------------------------
+
+
+class ApiQuotaSensor(_DiapStashEntity, SensorEntity):
+    """API requests left in the current rate-limit window (diagnostic)."""
+
+    _attr_name = "API Requests Remaining"
+    _attr_icon = "mdi:speedometer"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_native_unit_of_measurement = "requests"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "api_requests_remaining")
+
+    @property
+    def native_value(self) -> int | None:
+        return self.coordinator.ratelimit.get("remaining")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        interval = self.coordinator.update_interval
+        return {
+            "limit": self.coordinator.ratelimit.get("limit"),
+            "resets_in_seconds": self.coordinator.ratelimit.get("reset"),
+            "configured_interval_minutes": int(
+                self.coordinator.configured_interval.total_seconds() // 60
+            ),
+            "current_interval_seconds": int(interval.total_seconds()) if interval else None,
         }

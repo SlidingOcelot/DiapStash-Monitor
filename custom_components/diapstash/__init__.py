@@ -45,14 +45,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "consent prompt to enable long-lived token refresh."
         )
 
-    coordinator = DiapStashCoordinator(hass, client)
+    coordinator = DiapStashCoordinator(hass, entry, client)
     # Perform the first data fetch synchronously so HA can report setup failure
     # immediately (e.g. auth error, network unreachable) rather than deferring it.
     await coordinator.async_config_entry_first_refresh()
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # Reload when the options (update interval) change so the coordinator picks up
+    # the new interval immediately.
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
+
+
+async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload the entry after its options were changed."""
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

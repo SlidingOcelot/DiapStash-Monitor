@@ -8,7 +8,7 @@ import aiohttp
 
 from homeassistant.helpers import config_entry_oauth2_flow
 
-from .const import API_BASE_URL
+from .const import ACCIDENT_FETCH_SIZE, API_BASE_URL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -18,14 +18,12 @@ _RATELIMIT_WARN_THRESHOLD = 10
 
 
 def _parse_ratelimit_header(value: str) -> dict[str, int]:
-    """Parse IETF RateLimit header (draft-ietf-httpapi-ratelimit-headers-08).
+    """Parse an IETF RateLimit / RateLimit-Policy header (ratelimit-headers draft 8).
 
-    Expected format: 'quota-policy="name"; r=<remaining>; t=<seconds-to-reset>'
-    The first token is the quoted policy name and is skipped (split on ';')[1:]).
-
-    DiapStash docs use 'w' as the reset-seconds key; the IETF draft uses 't'.
-    Both are parsed so the coordinator backoff logic works regardless of which key
-    the server sends.
+    The server sends e.g. 'RateLimit: "per-user-120"; r=118; t=3540' and
+    'RateLimit-Policy: "per-user-120"; q=120; w=3600'. The first token is the quoted
+    policy name and is skipped. The DiapStash docs call the reset key 'w' while the
+    server (express-rate-limit, draft-8) sends 't', so callers accept both.
     """
     result: dict[str, int] = {}
     for part in value.split(";")[1:]:  # skip the quoted name token
@@ -63,6 +61,27 @@ class DiapStashApiClient:
     ) -> None:
         self._session = oauth_session
         self._client_id = client_id
+        # Latest rate-limit state reported by the server:
+        #   remaining — requests left in the current window
+        #   reset     — seconds until the window resets
+        #   limit     — requests allowed per window
+        # Keys are absent until the server has reported them.
+        self.ratelimit: dict[str, int] = {}
+
+    def _record_ratelimit(self, headers: Any) -> None:
+        rl_header = headers.get("RateLimit")
+        if rl_header:
+            rl = _parse_ratelimit_header(rl_header)
+            if "r" in rl:
+                self.ratelimit["remaining"] = rl["r"]
+            reset_in = rl.get("t", rl.get("w"))
+            if reset_in is not None:
+                self.ratelimit["reset"] = reset_in
+        policy = headers.get("RateLimit-Policy")
+        if policy:
+            limit = _parse_ratelimit_header(policy).get("q")
+            if limit is not None:
+                self.ratelimit["limit"] = limit
 
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Perform an authenticated GET and return the parsed JSON body.
@@ -71,8 +90,8 @@ class DiapStashApiClient:
           - HTTP 429 raises DiapStashRateLimitError with the raw RateLimit header so
             the coordinator can calculate the exact backoff duration.
           - Other non-2xx responses raise via raise_for_status() and propagate up.
-          - When remaining quota drops below _RATELIMIT_WARN_THRESHOLD a warning is
-            logged proactively so the user can act before backoff kicks in.
+          - The remaining quota is recorded on every response so the coordinator can
+            stretch the poll interval before the quota runs out.
         """
         resp = await self._session.async_request(
             "GET",
@@ -80,85 +99,45 @@ class DiapStashApiClient:
             params=params,
             headers={"DS-API-CLIENT-ID": self._client_id},
         )
+        self._record_ratelimit(resp.headers)
 
         # Check for rate-limit before raise_for_status so we can capture the header.
         if resp.status == 429:
             raise DiapStashRateLimitError(resp.headers.get("RateLimit", ""))
         resp.raise_for_status()
 
-        # Proactive quota warning on successful responses.
-        rl_header = resp.headers.get("RateLimit")
-        if rl_header:
-            rl = _parse_ratelimit_header(rl_header)
-            remaining = rl.get("r")
-            if remaining is not None and remaining < _RATELIMIT_WARN_THRESHOLD:
-                reset_in = rl.get("t") or rl.get("w")
-                _LOGGER.warning(
-                    "DiapStash quota low: %d requests remaining (resets in %s s).",
-                    remaining,
-                    reset_in if reset_in is not None else "?",
-                )
+        remaining = self.ratelimit.get("remaining")
+        if remaining is not None and remaining < _RATELIMIT_WARN_THRESHOLD:
+            _LOGGER.warning(
+                "DiapStash quota low: %d requests remaining (resets in %s s).",
+                remaining,
+                self.ratelimit.get("reset", "?"),
+            )
 
         return await resp.json()
 
-    async def get_current_change(self) -> dict[str, Any] | None:
-        """Return the active change (endTime is null) or None.
+    async def get_latest_change(self) -> dict[str, Any] | None:
+        """Return the user's ongoing or most recent change, or None if there is none.
 
-        Fetches only the most recent change sorted by startTime desc. A change is
-        considered active when its endTime field is null — the server sets endTime
-        when the user closes the change in the app. If the most recent change is
-        already closed, there is no active change and None is returned.
+        The change is active while its endTime is null. Each diaper in the response
+        carries its type details (name, brand, primary image, variant) inline, so no
+        separate type lookups are needed.
         """
-        data = await self._get(
-            "/api/v1/history/changes",
-            params={"size": 1, "sort": "startTime,desc"},
-        )
-        changes = data.get("data", [])
-        if changes and changes[0].get("endTime") is None:
-            return changes[0]
-        return None
+        try:
+            return await self._get("/api/v1/history/latest-change")
+        except aiohttp.ClientResponseError as err:
+            if err.status == 404:  # the user has no change recorded at all
+                return None
+            raise
 
-    async def get_accidents(self, size: int = 200) -> list[dict[str, Any]]:
+    async def get_accidents(self, size: int = ACCIDENT_FETCH_SIZE) -> list[dict[str, Any]]:
         """Return the most recent accidents, newest first.
 
-        size=200 is large enough to cover all accidents for a typical multi-day period
-        without hitting API pagination. The coordinator uses this list to populate
-        both accidents_for_change and accidents_outside_change, so it must include
-        accidents before the current change's startTime. Because the list is sorted
-        newest first, its first element is also the globally most recent accident.
+        The coordinator uses this one list for the current-change sensors, the
+        outside-change sensor, the daily/weekly counts and the history attribute.
         """
         data = await self._get(
             "/api/v1/history/accidents",
             params={"size": size, "sort": "when,desc"},
         )
         return data.get("data", [])
-
-    async def get_diaper_type(self, type_id: int) -> dict[str, Any] | None:
-        """Fetch a single type from the public catalogue by ID.
-
-        Returns the type object (the value of the 'type' key in the response) or None
-        when the server returns 404 (type does not exist in the public catalogue).
-        All other errors propagate so the coordinator can handle them.
-        """
-        try:
-            data = await self._get(f"/api/v1/type/types/{type_id}")
-            return data.get("type")
-        except aiohttp.ClientResponseError as err:
-            if err.status == 404:
-                return None
-            raise
-
-    async def get_custom_diaper_type(self, type_id: int) -> dict[str, Any] | None:
-        """Fetch a single user-defined type by ID.
-
-        Returns the type object or None on 404. Called as a fallback when the public
-        catalogue returns 404, indicating the type is user-created rather than from
-        the shared DiapStash catalogue.
-        """
-        try:
-            data = await self._get(f"/api/v1/type/types/custom/{type_id}")
-            return data.get("type")
-        except aiohttp.ClientResponseError as err:
-            if err.status == 404:
-                return None
-            raise

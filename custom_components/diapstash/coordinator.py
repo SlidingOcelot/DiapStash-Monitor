@@ -6,25 +6,38 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any
 
+import aiohttp
+
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import DiapStashApiClient, DiapStashRateLimitError, _parse_ratelimit_header
-from .const import ACCIDENT_LOCATION_TOILET, DEFAULT_SCAN_INTERVAL, DOMAIN, MIN_SCAN_INTERVAL
+from .const import (
+    ACCIDENT_LOCATION_TOILET,
+    API_CALLS_PER_POLL,
+    CONF_SCAN_INTERVAL,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+    EVENT_ACCIDENT,
+    MAX_SCAN_INTERVAL,
+    MIN_SCAN_INTERVAL,
+    RATELIMIT_RESERVE,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-# Hard timeout per full refresh cycle. Keeps a slow API from blocking HA's event loop.
+# Hard timeout per full refresh cycle. Keeps a slow API from blocking updates.
 _API_TIMEOUT = 30
 
 
 def _parse_utc(value: str | None) -> datetime | None:
     """Parse an ISO-8601 UTC timestamp string into a timezone-aware datetime.
 
-    DiapStash uses 'Z' suffix for UTC. Python's fromisoformat() does not understand
-    'Z' before 3.11, so we replace it with '+00:00' for broad compatibility.
-    Returns None on missing or malformed input so callers can treat it as "unknown".
+    DiapStash uses a 'Z' suffix for UTC; it is replaced with '+00:00' for
+    compatibility with older Python versions. Returns None on missing or malformed
+    input so callers can treat it as "unknown".
     """
     if not value:
         return None
@@ -34,213 +47,261 @@ def _parse_utc(value: str | None) -> datetime | None:
         return None
 
 
-class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Single coordinator that fetches all DiapStash data used by the sensors.
+def accident_summary(accident: dict[str, Any]) -> dict[str, Any]:
+    """Snake_case view of an accident, used for attributes and event data."""
+    return {
+        "id": accident.get("id"),
+        "type": accident.get("type"),
+        "when": accident.get("when"),
+        "precision_time": accident.get("precisionTime"),
+        "level": accident.get("level"),
+        "cause": accident.get("cause"),
+        "cause_leak": accident.get("causeLeak"),
+        "location": accident.get("location"),
+        "position": accident.get("position"),
+        "linked_change_id": accident.get("linkedChangeId"),
+    }
 
-    All sensors share one coordinator so the integration makes exactly one set of
-    API calls per poll cycle instead of one per sensor.
+
+def _diaper_details(change: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten the inline type details of a change's diapers, in wearing order.
+
+    The latest-change endpoint embeds each diaper's type (name, brand, primary image)
+    and the selected variant, so names and pictures need no extra API calls. The
+    variant picture is preferred over the type picture when both exist.
+    """
+    result = []
+    for d in sorted(change.get("diapers") or [], key=lambda d: d.get("order", 0)):
+        type_info = d.get("type") or {}
+        variant = type_info.get("variant") or {}
+        image = (variant.get("primaryImage") or {}).get("url") or (
+            type_info.get("primaryImage") or {}
+        ).get("url")
+        result.append(
+            {
+                "name": type_info.get("name") or str(d.get("typeId")),
+                "brand": (type_info.get("brand") or {}).get("name"),
+                "variant": variant.get("name"),
+                "size": d.get("size"),
+                "type_id": d.get("typeId"),
+                "image_url": image,
+            }
+        )
+    return result
+
+
+class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
+    """Single coordinator that fetches all DiapStash data used by the entities.
+
+    Every poll makes exactly API_CALLS_PER_POLL requests (latest-change and
+    accidents); all sensors, counts and history are derived from those two responses.
     """
 
-    def __init__(self, hass: HomeAssistant, client: DiapStashApiClient) -> None:
-        # Store the intended interval separately so we can always heal back to it
-        # after a rate-limit backoff. The coordinator's update_interval attribute is
-        # mutated during backoff; _normal_update_interval is the canonical default.
-        self._normal_update_interval = timedelta(
-            minutes=max(DEFAULT_SCAN_INTERVAL, MIN_SCAN_INTERVAL)
-        )
+    def __init__(
+        self, hass: HomeAssistant, entry: ConfigEntry, client: DiapStashApiClient
+    ) -> None:
+        self._entry = entry
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=self._normal_update_interval,
+            update_interval=self.configured_interval,
         )
         self._client = client
+        # IDs of accidents already seen. None until the first successful poll, which
+        # only seeds the set so existing accidents do not fire events after a restart.
+        self._seen_accident_ids: set[str] | None = None
 
-        # typeId → display name / image URL caches.
-        # Populated on demand: only types actually referenced by the active change are
-        # fetched. Types are immutable so the cache never needs to be invalidated.
-        # A type mapped to its raw str(id) indicates a previous lookup returned no
-        # result from either endpoint and will not be retried.
-        self._cached_diaper_types: dict[int, str] = {}
-        self._cached_diaper_type_images: dict[int, str] = {}
-        self._cached_diaper_variant_images: dict[str, str] = {}
+    @property
+    def configured_interval(self) -> timedelta:
+        """Poll interval chosen in the integration options, clamped to safe bounds."""
+        minutes = self._entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+        try:
+            minutes = int(minutes)
+        except (TypeError, ValueError):
+            minutes = DEFAULT_SCAN_INTERVAL
+        return timedelta(minutes=min(max(minutes, MIN_SCAN_INTERVAL), MAX_SCAN_INTERVAL))
+
+    @property
+    def ratelimit(self) -> dict[str, int]:
+        """Latest rate-limit state reported by the API (remaining, reset, limit)."""
+        return self._client.ratelimit
+
+    def _interval_for_quota(self) -> timedelta:
+        """Return the configured interval, stretched if the remaining quota is too low.
+
+        The remaining requests must last until the quota window resets. If they would
+        not at the configured pace, polls are spread evenly over the rest of the
+        window (keeping RATELIMIT_RESERVE requests spare for restarts and reloads).
+        If not even one more poll fits, wait for the window to reset.
+        """
+        configured = self.configured_interval
+        remaining = self.ratelimit.get("remaining")
+        reset_in = self.ratelimit.get("reset")
+        if remaining is None or reset_in is None:
+            return configured
+
+        polls_left = (remaining - RATELIMIT_RESERVE) // API_CALLS_PER_POLL
+        if polls_left < 1:
+            interval = timedelta(seconds=reset_in + 5)
+        else:
+            interval = max(configured, timedelta(seconds=reset_in / polls_left))
+
+        if interval > configured:
+            _LOGGER.info(
+                "DiapStash quota: %d requests left, window resets in %d s. "
+                "Next update in %d s instead of %d s.",
+                remaining,
+                reset_in,
+                interval.total_seconds(),
+                configured.total_seconds(),
+            )
+        return interval
 
     async def _async_update_data(self) -> dict[str, Any]:
-        # Heal any prior rate-limit backoff at the start of each successful cycle.
-        # This ensures the interval self-corrects without requiring a restart.
-        self.update_interval = self._normal_update_interval
-
         try:
             async with asyncio.timeout(_API_TIMEOUT):
-                return await self._fetch()
+                data = await self._fetch()
 
         # ConfigEntryAuthFailed must bubble up first so HA can show the re-auth UI.
-        # It is a subclass of HomeAssistantError, so the order of the two handlers matters.
+        # It is a subclass of HomeAssistantError, so the order of the handlers matters.
         except ConfigEntryAuthFailed:
             raise
 
-        # HA's OAuth2 session raises HomeAssistantError when token refresh fails.
-        # Re-raise as ConfigEntryAuthFailed so HA disables the integration and shows
-        # a Repair notification that triggers the async_step_reauth flow in config_flow.py.
-        except HomeAssistantError as err:
-            _LOGGER.warning(
-                "DiapStash token refresh failed — the refresh token has likely expired "
-                "(14-day TTL). HA will show a Repair notification: click Fix to re-authorize."
-            )
-            raise ConfigEntryAuthFailed(str(err)) from err
-
-        # On HTTP 429 the API returns a RateLimit header with quota and reset time.
-        # We extend update_interval until the quota window resets (+5 s buffer),
-        # then raise UpdateFailed so HA marks the sensors unavailable until recovery.
+        # On HTTP 429 wait until the quota window resets (+5 s buffer), then raise
+        # UpdateFailed so HA marks the entities unavailable until recovery.
         except DiapStashRateLimitError as err:
             rl = _parse_ratelimit_header(err.ratelimit_header)
-            reset_in = rl.get("t") or rl.get("w")  # 't' = IETF draft, 'w' = DiapStash docs
+            reset_in = rl.get("t", rl.get("w"))
             if reset_in:
                 self.update_interval = timedelta(seconds=reset_in + 5)
                 _LOGGER.warning(
-                    "DiapStash rate limit reached. Backing off for %d s (quota resets in %d s).",
-                    reset_in + 5,
-                    reset_in,
+                    "DiapStash rate limit reached. Backing off for %d s.", reset_in + 5
                 )
             else:
                 _LOGGER.warning("DiapStash rate limit reached. No reset time in RateLimit header.")
             raise UpdateFailed("DiapStash rate limit reached") from err
 
+        except aiohttp.ClientResponseError as err:
+            if err.status == 401:
+                raise ConfigEntryAuthFailed("DiapStash token rejected") from err
+            if err.status == 403:
+                # Missing scope, e.g. cloud-sync.accidents once the deprecated
+                # cloud-sync.history fallback is removed. Re-authorising requests the
+                # current SCOPES list.
+                raise ConfigEntryAuthFailed(
+                    "DiapStash denied access (missing scope). Enable all required scopes "
+                    "on your DiapStash API client and re-authorize."
+                ) from err
+            raise UpdateFailed(f"DiapStash API error: HTTP {err.status}") from err
+
+        # HA's OAuth2 session raises HomeAssistantError when token refresh fails.
+        # Re-raise as ConfigEntryAuthFailed so HA shows a Repair notification that
+        # triggers the reauth flow in config_flow.py.
+        except HomeAssistantError as err:
+            _LOGGER.warning(
+                "DiapStash token refresh failed — the refresh token has likely expired "
+                "(7-day lifetime). HA will show a Repair notification: click Fix to re-authorize."
+            )
+            raise ConfigEntryAuthFailed(str(err)) from err
+
         except Exception as err:
             raise UpdateFailed(f"Error communicating with DiapStash API: {err}") from err
 
+        self.update_interval = self._interval_for_quota()
+        return data
+
     async def _fetch(self) -> dict[str, Any]:
-        """Fetch all data from the DiapStash API and return it as a single dict.
+        """Fetch the latest change and recent accidents, and derive all sensor data."""
+        latest_change = await self._client.get_latest_change()
+        all_accidents = await self._client.get_accidents()
 
-        Data flow:
-          1. Fetch the active change (most recent change with endTime == null).
-          2. Fetch all recent accidents and partition them into two lists:
-               - accidents_for_change:  accidents that happened during the active change.
-               - accidents_outside_change: accidents that happened between changes.
-          3. Take the globally most-recent accident from that list (LastAccidentSensor).
-          4. Fetch the diaper type catalogue (cached; refreshed only on cache miss).
+        # The latest change is the current one only while its endTime is null.
+        current_change = (
+            latest_change
+            if latest_change is not None and latest_change.get("endTime") is None
+            else None
+        )
+
+        accidents_for_change, accidents_outside_change = self._partition(
+            current_change, all_accidents
+        )
+        self._fire_new_accident_events(all_accidents, accidents_for_change)
+
+        return {
+            "latest_change": latest_change,
+            "current_change": current_change,
+            "diapers": _diaper_details(current_change) if current_change else [],
+            # Newest first, toilet visits excluded.
+            "accidents_for_change": accidents_for_change,
+            "accidents_outside_change": accidents_outside_change,
+            # Newest first, everything including toilet visits.
+            "accidents": all_accidents,
+            "last_accident": all_accidents[0] if all_accidents else None,
+        }
+
+    @staticmethod
+    def _partition(
+        current_change: dict[str, Any] | None, all_accidents: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split accidents into those during the current change and those outside one.
+
+        Toilet visits are excluded from both lists. Accidents linked to a past change
+        are historical and belong to neither list. DiapStash only fills linkedChangeId
+        when a change closes, so during an active change its accidents are unlinked
+        and are matched by timestamp instead: unlinked accidents at or after the
+        change start belong to it, earlier ones happened without a diaper.
         """
-        import aiohttp
-
-        # --- Step 1: Active change ---
-        # A change is considered active when its endTime is null.
-        # Returns None when no change is active (not wearing a diaper).
-        try:
-            current_change = await self._client.get_current_change()
-        except aiohttp.ClientResponseError as err:
-            if err.status == 401:
-                raise ConfigEntryAuthFailed("DiapStash token expired") from err
-            raise
-
-        # --- Step 2: Accident partitioning ---
-        # Accidents are always fetched, regardless of whether a change is active.
-        # This is needed to populate accidents_outside_change when not wearing.
-        accidents_for_change: list[dict[str, Any]] = []
-        accidents_outside_change: list[dict[str, Any]] = []
-        try:
-            all_accidents = await self._client.get_accidents()
-        except aiohttp.ClientResponseError as err:
-            if err.status == 401:
-                raise ConfigEntryAuthFailed("DiapStash token expired") from err
-            raise
-
-        # Extract change identity for comparison. When current_change is None these
-        # will both be None and all null-linked accidents fall into outside_change.
+        for_change: list[dict[str, Any]] = []
+        outside: list[dict[str, Any]] = []
         change_id = (current_change or {}).get("id")
         change_start = _parse_utc((current_change or {}).get("startTime"))
 
         for a in all_accidents:
-            # Toilet accidents represent toilet-training visits, not diaper soiling.
-            # Exclude them from both lists so they don't influence diaper state,
-            # accident counts, peak levels, or outside-change automations.
             if a.get("location") == ACCIDENT_LOCATION_TOILET:
                 continue
-
             linked = a.get("linkedChangeId")
-
             if linked is not None:
-                # The accident has been back-linked to a specific change by the server.
-                # DiapStash only fills this field when the change closes, so during an
-                # active change all accidents will have linkedChangeId == null.
                 if linked == change_id:
-                    accidents_for_change.append(a)
-                # Accidents linked to a past (closed) change are ignored in both lists;
-                # they are historical data not relevant to the current sensor readings.
-
+                    for_change.append(a)
+            elif change_start is not None:
+                when = _parse_utc(a.get("when"))
+                if when is not None and when >= change_start:
+                    for_change.append(a)
+                else:
+                    outside.append(a)
             else:
-                # linkedChangeId is null — the accident has not been linked yet.
-                # This is the normal state for all accidents during an active change.
-                # We decide which list it belongs to by comparing its timestamp against
-                # the change start time:
-                #   >= change_start → happened during the current change (unlinked yet)
-                #   <  change_start → happened before this change started (bare accident)
-                # When there is no active change, all null-linked accidents are bare.
-                if change_start is not None:
-                    when = _parse_utc(a.get("when"))
-                    if when is not None and when >= change_start:
-                        accidents_for_change.append(a)
-                    else:
-                        accidents_outside_change.append(a)
-                else:
-                    # No active change → every null-linked accident is outside a change.
-                    accidents_outside_change.append(a)
+                outside.append(a)
+        return for_change, outside
 
-        # --- Step 3: Global last accident ---
-        # all_accidents is sorted by 'when' descending, so its first element is the
-        # most recent accident regardless of change context or location. Taking it
-        # from the unfiltered list saves a dedicated API request per poll.
-        last_accident = all_accidents[0] if all_accidents else None
+    def _fire_new_accident_events(
+        self,
+        all_accidents: list[dict[str, Any]],
+        accidents_for_change: list[dict[str, Any]],
+    ) -> None:
+        """Fire EVENT_ACCIDENT once for every accident not seen in a previous poll.
 
-        # --- Step 4: Diaper type cache (on-demand) ---
-        # Fetch type details only for typeIds present in the current change that are
-        # not already cached. The public endpoint is tried first; if it returns 404
-        # the type is user-created and the custom endpoint is tried as a fallback.
-        # Types are immutable so the cache is never invalidated.
-        # A 401 propagates immediately to trigger re-auth. Other per-type errors are
-        # logged at debug and retried on the next poll without caching the failure.
-        # A type that returns 404 from both endpoints is stored as str(id) so it is
-        # not retried repeatedly (unknown/deleted types).
-        if current_change:
-            needed_ids: set[int] = set()
-            for d in current_change.get("diapers") or []:
-                raw = d.get("typeId")
-                try:
-                    needed_ids.add(int(raw))
-                except (TypeError, ValueError):
-                    pass
-            for type_id in needed_ids - self._cached_diaper_types.keys():
-                try:
-                    type_obj = await self._client.get_diaper_type(type_id)
-                    if type_obj is None:
-                        type_obj = await self._client.get_custom_diaper_type(type_id)
-                except aiohttp.ClientResponseError as err:
-                    if err.status == 401:
-                        raise ConfigEntryAuthFailed("DiapStash token expired") from err
-                    _LOGGER.debug("Could not fetch type %d (HTTP %d); will retry", type_id, err.status)
-                    continue
-                except Exception:
-                    _LOGGER.debug("Could not fetch type %d; will retry next poll", type_id)
-                    continue
+        The first poll after startup only records the existing accidents. Events are
+        fired oldest first so automations and the logbook see them in order.
+        """
+        ids = {a["id"] for a in all_accidents if a.get("id")}
+        if self._seen_accident_ids is None:
+            self._seen_accident_ids = ids
+            return
 
-                if type_obj:
-                    self._cached_diaper_types[type_id] = type_obj.get("name", str(type_id))
-                    pi = type_obj.get("primaryImage") or {}
-                    if pi.get("url"):
-                        self._cached_diaper_type_images[type_id] = pi["url"]
-                    for v in type_obj.get("variants") or []:
-                        vpi = v.get("primaryImage") or {}
-                        if v.get("id") and vpi.get("url"):
-                            self._cached_diaper_variant_images[str(v["id"])] = vpi["url"]
-                else:
-                    # 404 from both endpoints — store raw id string to prevent retries.
-                    self._cached_diaper_types[type_id] = str(type_id)
-
-        return {
-            "current_change": current_change,
-            "accidents_for_change": accidents_for_change,
-            "accidents_outside_change": accidents_outside_change,
-            "last_accident": last_accident,
-            "diaper_types": self._cached_diaper_types,
-            "diaper_type_images": self._cached_diaper_type_images,
-            "diaper_variant_images": self._cached_diaper_variant_images,
-        }
+        in_change = {a.get("id") for a in accidents_for_change}
+        for accident in reversed(all_accidents):
+            accident_id = accident.get("id")
+            if not accident_id or accident_id in self._seen_accident_ids:
+                continue
+            self.hass.bus.async_fire(
+                EVENT_ACCIDENT,
+                {
+                    **accident_summary(accident),
+                    "during_change": accident_id in in_change,
+                    "config_entry_id": self._entry.entry_id,
+                },
+            )
+        # Only accidents still in the fetched window are remembered; one that drops
+        # out of the window cannot come back as "new".
+        self._seen_accident_ids = ids
