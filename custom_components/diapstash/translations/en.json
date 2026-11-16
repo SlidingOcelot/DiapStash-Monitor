@@ -11,6 +11,7 @@
     },
     "abort": {
       "already_configured": "DiapStash is already configured.",
+      "single_instance_allowed": "DiapStash is already configured. Only one DiapStash account can be set up.",
       "oauth_error": "Received invalid token data.",
       "oauth_unauthorized": "OAuth authorisation was rejected by DiapStash.",
       "oauth_timeout": "Timeout resolving OAuth token.",

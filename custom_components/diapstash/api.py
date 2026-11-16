@@ -124,28 +124,14 @@ class DiapStashApiClient:
         size=200 is large enough to cover all accidents for a typical multi-day period
         without hitting API pagination. The coordinator uses this list to populate
         both accidents_for_change and accidents_outside_change, so it must include
-        accidents before the current change's startTime.
+        accidents before the current change's startTime. Because the list is sorted
+        newest first, its first element is also the globally most recent accident.
         """
         data = await self._get(
             "/api/v1/history/accidents",
             params={"size": size, "sort": "when,desc"},
         )
         return data.get("data", [])
-
-    async def get_last_accident(self) -> dict[str, Any] | None:
-        """Return the single most recent accident, regardless of change context.
-
-        This is a separate call from get_accidents() even though it returns a subset
-        of the same data. It is kept as a dedicated call so the LastAccidentSensor can
-        show a globally most-recent accident independently of the coordinator's accident
-        partitioning logic.
-        """
-        data = await self._get(
-            "/api/v1/history/accidents",
-            params={"size": 1, "sort": "when,desc"},
-        )
-        accidents = data.get("data", [])
-        return accidents[0] if accidents else None
 
     async def get_diaper_type(self, type_id: int) -> dict[str, Any] | None:
         """Fetch a single type from the public catalogue by ID.

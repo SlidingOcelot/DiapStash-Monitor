@@ -4,15 +4,35 @@
 
 > **Vibe coded disclaimer:** This integration was built with AI pair programming assistance (Claude). It works, but has not been formally audited or extensively tested. Use at your own risk, contributions welcome.
 
-A [Home Assistant](https://www.home-assistant.io/) integration that polls the [DiapStash](https://diapstash.com) Cloud Sync API and exposes three sensors.
+A [Home Assistant](https://www.home-assistant.io/) integration that polls the [DiapStash](https://diapstash.com) Cloud Sync API and exposes sensors for the current diaper change and recent accidents.
 
-## Sensors
+## Entities
+
+All entities belong to one **DiapStash** device.
+
+### Sensors
 
 | Entity | State | Notes |
 |---|---|---|
-| `sensor.diapstash_current_diaper` | Diaper type name(s) or `not wearing` | Type resolved from the DiapStash catalogue; multiple diapers comma-separated |
-| `sensor.diapstash_diaper_state` | `Dry` / `Wet` / `Messy` / `Wet & Messy` | Derived from accidents linked to the active change; `unavailable` when not wearing |
-| `sensor.diapstash_last_accident` | `wetting` or `mess` | All accident properties exposed as attributes |
+| `sensor.diapstash_current_diaper` | Diaper type name(s) or `not wearing` | Type resolved from the DiapStash catalogue (public or custom types); stacked diapers comma-separated |
+| `sensor.diapstash_diaper_state` | `Dry` / `Wet` / `Messy` / `Wet & Messy` | Derived from accidents during the active change; `unknown` when not wearing |
+| `sensor.diapstash_wet_accident_count` | Number | Wetting accidents in the current change |
+| `sensor.diapstash_messy_accident_count` | Number | Mess accidents in the current change |
+| `sensor.diapstash_peak_wetness_level` | 0–5 | Highest wetting level in the current change |
+| `sensor.diapstash_peak_messy_level` | 0–5 | Highest mess level in the current change |
+| `sensor.diapstash_last_wetting` | Timestamp | Most recent wetting in the current change |
+| `sensor.diapstash_last_mess` | Timestamp | Most recent mess in the current change |
+| `sensor.diapstash_last_accident` | `wetting` or `mess` | Most recent accident overall; all properties exposed as attributes |
+| `sensor.diapstash_last_outside_accident` | `wetting` or `mess` | Most recent accident that happened while not wearing a diaper |
+
+### Binary sensors
+
+| Entity | On when |
+|---|---|
+| `binary_sensor.diapstash_leak` | Any accident in the current change is marked as a leak |
+| `binary_sensor.diapstash_messy_overflow` | The current change is flagged as a messy overflow |
+
+Sensors tied to the current change are `unknown` while no diaper is being worn. Accidents logged with location `toilet` are ignored by the change-based sensors.
 
 ## Prerequisites
 
@@ -23,7 +43,7 @@ A [Home Assistant](https://www.home-assistant.io/) integration that polls the [D
 ## Installation via HACS
 
 1. Open HACS → **Integrations** → ⋮ → **Custom repositories**.
-2. Add `https://github.com/kribi/ha-diapstash` with category **Integration**.
+2. Add `https://github.com/SlidingOcelot/DiapStash-Monitor` with category **Integration**.
 3. Search for *DiapStash* and click **Download**.
 4. Restart Home Assistant.
 
@@ -38,7 +58,9 @@ Copy the `custom_components/diapstash` folder into your HA `config/custom_compon
 
 ## Update interval
 
-Sensors are refreshed every **5 minutes** to be respectful of the DiapStash API.
+Sensors are refreshed every **5 minutes** to be respectful of the DiapStash API. Each refresh makes 2 API requests (plus a one-off lookup per new diaper type).
+
+Only one DiapStash account can be configured per Home Assistant instance.
 
 ## Attributes
 
@@ -50,6 +72,9 @@ Sensors are refreshed every **5 minutes** to be respectful of the DiapStash API.
 | `change_period` | `DAY` or `NIGHT` |
 | `note` | User note on the change |
 | `tags` | User tags on the change |
+| `diaper_count` | Number of diapers in the change (stacking) |
+| `image_url` | Picture of the first diaper, from the catalogue |
+| `image_urls` | Pictures of all diapers in the change |
 
 ### `sensor.diapstash_diaper_state`
 | Attribute | Description |

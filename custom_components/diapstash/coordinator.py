@@ -117,7 +117,7 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
           2. Fetch all recent accidents and partition them into two lists:
                - accidents_for_change:  accidents that happened during the active change.
                - accidents_outside_change: accidents that happened between changes.
-          3. Fetch the globally most-recent accident (for the LastAccidentSensor).
+          3. Take the globally most-recent accident from that list (LastAccidentSensor).
           4. Fetch the diaper type catalogue (cached; refreshed only on cache miss).
         """
         import aiohttp
@@ -186,15 +186,10 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     accidents_outside_change.append(a)
 
         # --- Step 3: Global last accident ---
-        # Fetched separately from get_accidents() because it is a dedicated single-item
-        # call that is independent of change context; the LastAccidentSensor shows it
-        # regardless of whether a change is currently active.
-        try:
-            last_accident = await self._client.get_last_accident()
-        except aiohttp.ClientResponseError as err:
-            if err.status == 401:
-                raise ConfigEntryAuthFailed("DiapStash token expired") from err
-            raise
+        # all_accidents is sorted by 'when' descending, so its first element is the
+        # most recent accident regardless of change context or location. Taking it
+        # from the unfiltered list saves a dedicated API request per poll.
+        last_accident = all_accidents[0] if all_accidents else None
 
         # --- Step 4: Diaper type cache (on-demand) ---
         # Fetch type details only for typeIds present in the current change that are

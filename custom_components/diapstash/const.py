@@ -26,6 +26,6 @@ SCOPES = ["offline_access", "cloud-sync.history", "cloud-sync.types"]
 ACCIDENT_LOCATION_TOILET = "toilet"
 
 DEFAULT_SCAN_INTERVAL = 5   # minutes
-# Rate limit budget: 120 req/hr ÷ 3 API calls per poll (types cached) = 40 polls/hr max.
-# 40 polls/hr = one poll every 1.5 min, so a 1-minute floor still keeps us within budget.
+# Rate limit budget: 120 req/hr ÷ 2 API calls per poll (types cached) = 60 polls/hr max,
+# i.e. one poll per minute, so a 1-minute floor keeps us within budget.
 MIN_SCAN_INTERVAL = 1       # minutes
