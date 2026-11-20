@@ -13,8 +13,15 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
-from .const import ACCIDENT_LOCATION_TOILET, DOMAIN, HISTORY_LENGTH
-from .coordinator import DiapStashCoordinator, _parse_utc, accident_summary
+from .const import (
+    ACCIDENT_LOCATION_TOILET,
+    CHANGE_HISTORY_DAYS,
+    CHANGE_HISTORY_LENGTH,
+    DOMAIN,
+    HISTORY_LENGTH,
+    STREAK_BREAK_MINUTES,
+)
+from .coordinator import DiapStashCoordinator, _diaper_details, _parse_utc, accident_summary
 
 # Human-readable state strings for DiaperStateSensor.
 _STATE_NOT_WEARING = "not wearing"
@@ -54,6 +61,14 @@ async def async_setup_entry(
             LastOutsideAccidentSensor(coordinator, entry),
             AccidentsTodaySensor(coordinator, entry),
             AccidentsWeekSensor(coordinator, entry),
+            TotalChangesSensor(coordinator, entry),
+            TotalDiapersSensor(coordinator, entry),
+            TotalTimeInDiapersSensor(coordinator, entry),
+            AverageChangeDurationSensor(coordinator, entry),
+            StreakSensor(coordinator, entry),
+            ChangesTodaySensor(coordinator, entry),
+            ChangeHistorySensor(coordinator, entry),
+            PreviousChangeSensor(coordinator, entry),
             ApiQuotaSensor(coordinator, entry),
         ]
     )
@@ -555,6 +570,411 @@ class AccidentsWeekSensor(_AccidentPeriodSensor):
             **super().extra_state_attributes,
             "history": [accident_summary(a) for a in recent],
         }
+
+
+# --- Lifetime statistics, streak and change history ----------------------------
+# Fed by coordinator.data["history"], which is refreshed when a change starts, ends
+# or is edited, and at least hourly. Unavailable until the first successful fetch.
+
+
+def _change_duration(change: dict[str, Any]) -> int | None:
+    """Minutes worn for a completed change, None while ongoing or malformed."""
+    minutes = _minutes_between(
+        _parse_utc(change.get("startTime")), _parse_utc(change.get("endTime"))
+    )
+    return minutes if minutes is not None and minutes >= 0 else None
+
+
+def _change_names(change: dict[str, Any]) -> str:
+    return ", ".join(d["name"] for d in _diaper_details(change)) or "unknown"
+
+
+def _change_summary(change: dict[str, Any], accident_counts: dict[Any, int]) -> dict[str, Any]:
+    """Snake_case view of a change for attributes."""
+    return {
+        "id": change.get("id"),
+        "start": change.get("startTime"),
+        "end": change.get("endTime"),
+        "duration_minutes": _change_duration(change),
+        "diapers": _change_names(change),
+        "state": change.get("state"),
+        "wetness": change.get("wetness"),
+        "messy_level": change.get("messyLevel"),
+        "leak": change.get("leak"),
+        "messy_overflow": change.get("messyOverflow"),
+        "period": change.get("changePeriod"),
+        "accidents": accident_counts.get(change.get("id"), 0),
+    }
+
+
+def _accidents_per_change(
+    changes: list[dict[str, Any]], accidents: list[dict[str, Any]]
+) -> dict[Any, int]:
+    """Count accidents (toilet visits excluded) per change id.
+
+    Linked accidents count for their change; unlinked ones count for the change
+    whose time range contains them, as DiapStash does not always link them.
+    """
+    ranges = [
+        (c.get("id"), _parse_utc(c.get("startTime")), _parse_utc(c.get("endTime")))
+        for c in changes
+    ]
+    counts: dict[Any, int] = {}
+    for accident in accidents:
+        if accident.get("location") == ACCIDENT_LOCATION_TOILET:
+            continue
+        change_id = accident.get("linkedChangeId")
+        if change_id is None:
+            when = _parse_utc(accident.get("when"))
+            change_id = next(
+                (
+                    cid
+                    for cid, start, end in ranges
+                    if when is not None and start is not None and start <= when
+                    and (end is None or when <= end)
+                ),
+                None,
+            )
+        if change_id is not None:
+            counts[change_id] = counts.get(change_id, 0) + 1
+    return counts
+
+
+def _average(values: list[int]) -> int | None:
+    return round(sum(values) / len(values)) if values else None
+
+
+class _HistoryEntity(_DiapStashEntity):
+    """Entity fed by the lifetime stats, streak and change history."""
+
+    @property
+    def _history(self) -> dict[str, Any] | None:
+        return self.coordinator.data.get("history")
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._history is not None
+
+    @property
+    def _stats(self) -> dict[str, Any]:
+        return (self._history or {}).get("stats") or {}
+
+    @property
+    def _changes(self) -> list[dict[str, Any]]:
+        """Changes of the last CHANGE_HISTORY_DAYS days, newest first."""
+        return (self._history or {}).get("changes") or []
+
+
+class TotalChangesSensor(_HistoryEntity, SensorEntity):
+    """Number of changes ever recorded, with per-period counts.
+
+    The week/month/year counts are computed by DiapStash in UTC.
+    """
+
+    _attr_name = "Total Changes"
+    _attr_icon = "mdi:counter"
+    _attr_native_unit_of_measurement = "changes"
+    # TOTAL, not TOTAL_INCREASING: deleting a change (or the live estimate being
+    # corrected) lowers the value, which TOTAL_INCREASING would treat as a reset.
+    _attr_state_class = SensorStateClass.TOTAL
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "total_changes")
+
+    @property
+    def native_value(self) -> int | None:
+        return self._stats.get("changeCount")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        stats = self._stats
+        periods = stats.get("changesByPeriod") or {}
+        return {
+            "first_change": stats.get("firstChangeAt"),
+            "wet_changes": stats.get("wetCount"),
+            "messy_changes": stats.get("messyCount"),
+            "day_changes": stats.get("dayCount"),
+            "night_changes": stats.get("nightCount"),
+            "this_week": periods.get("weekToDate"),
+            "last_7_days": periods.get("weekRolling"),
+            "this_month": periods.get("monthToDate"),
+            "last_month": periods.get("monthRolling"),
+            "this_year": periods.get("yearToDate"),
+            "last_year": periods.get("yearRolling"),
+        }
+
+
+class TotalDiapersSensor(_HistoryEntity, SensorEntity):
+    """Number of diapers ever used (stacked diapers count individually)."""
+
+    _attr_name = "Total Diapers Used"
+    _attr_icon = "mdi:package-variant-closed"
+    _attr_native_unit_of_measurement = "diapers"
+    # TOTAL, not TOTAL_INCREASING: deleting a change (or the live estimate being
+    # corrected) lowers the value, which TOTAL_INCREASING would treat as a reset.
+    _attr_state_class = SensorStateClass.TOTAL
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "total_diapers")
+
+    @property
+    def native_value(self) -> int | None:
+        return self._stats.get("diaperCount")
+
+
+class TotalTimeInDiapersSensor(_HistoryEntity, _MinuteTickEntity, SensorEntity):
+    """Total time ever spent in diapers, including the change being worn now."""
+
+    _attr_name = "Total Time in Diapers"
+    _attr_icon = "mdi:timer-outline"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.HOURS
+    _attr_suggested_display_precision = 1
+    # TOTAL, not TOTAL_INCREASING: deleting a change (or the live estimate being
+    # corrected) lowers the value, which TOTAL_INCREASING would treat as a reset.
+    _attr_state_class = SensorStateClass.TOTAL
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "total_time_in_diapers")
+
+    @property
+    def native_value(self) -> float | None:
+        seconds = self._stats.get("totalTimeInDiaperSeconds")
+        if seconds is None:
+            return None
+        # DiapStash leaves the ongoing change out of the total; add it live.
+        if self._current_change is not None:
+            start = _parse_utc(self._current_change.get("startTime"))
+            if start is not None:
+                seconds += max((dt_util.utcnow() - start).total_seconds(), 0)
+        return round(seconds / 3600, 2)
+
+
+class AverageChangeDurationSensor(_HistoryEntity, SensorEntity):
+    """Average time a diaper is worn, over all completed changes ever."""
+
+    _attr_name = "Average Change Duration"
+    _attr_icon = "mdi:timer-cog-outline"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.MINUTES
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "average_change_duration")
+
+    @property
+    def native_value(self) -> int | None:
+        seconds = self._stats.get("averageTimeInDiaperSeconds")
+        return round(seconds / 60) if seconds is not None else None
+
+
+class StreakSensor(_HistoryEntity, _MinuteTickEntity, SensorEntity):
+    """Length of the current (or most recent) run of back-to-back changes.
+
+    DiapStash reports the most recent streak of completed changes: changes whose
+    gap from the previous change's end is at most STREAK_BREAK_MINUTES. The change
+    being worn now continues that streak if it started within the break window,
+    otherwise it starts a new one. Only real time in a diaper is counted.
+    """
+
+    _attr_name = "Diaper Streak"
+    _attr_icon = "mdi:fire"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.HOURS
+    _attr_suggested_display_precision = 1
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "streak")
+
+    def _streak(self) -> dict[str, Any]:
+        streak = (self._history or {}).get("streak") or {}
+        minutes = streak.get("totalTimeInDiaperMinutes") or 0
+        changes = streak.get("changeCount") or 0
+        diapers = streak.get("diaperCount") or 0
+        start = _parse_utc(streak.get("startAt"))
+        end = _parse_utc(streak.get("endAt"))
+        now = dt_util.utcnow()
+        brk = timedelta(minutes=STREAK_BREAK_MINUTES)
+
+        current = self._current_change
+        current_start = _parse_utc(current.get("startTime")) if current else None
+        if current_start is not None:
+            worn = max(int((now - current_start).total_seconds() // 60), 0)
+            if end is not None and current_start - end <= brk:
+                minutes, changes, start = minutes + worn, changes + 1, start or current_start
+            else:  # too long a gap: the current change starts a new streak
+                minutes, changes, start = worn, 1, current_start
+                diapers = 0
+            diapers += len(current.get("diapers") or [])
+            active, end = True, None
+        else:
+            active = end is not None and now - end <= brk
+        return {
+            "minutes": minutes,
+            "active": active,
+            "changes": changes,
+            "diapers": diapers,
+            "started": start.isoformat() if start else None,
+            "ended": end.isoformat() if end else None,
+        }
+
+    @property
+    def native_value(self) -> float | None:
+        if self._history is None:
+            return None
+        return round(self._streak()["minutes"] / 60, 2)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        if self._history is None:
+            return {}
+        streak = self._streak()
+        del streak["minutes"]
+        return {**streak, "break_minutes": STREAK_BREAK_MINUTES}
+
+
+class ChangesTodaySensor(_HistoryEntity, _MinuteTickEntity, SensorEntity):
+    """Changes started since local midnight, including the one worn now."""
+
+    _attr_name = "Changes Today"
+    _attr_icon = "mdi:calendar-check"
+    _attr_native_unit_of_measurement = "changes"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "changes_today")
+
+    def _today(self) -> list[dict[str, Any]]:
+        midnight = dt_util.start_of_local_day()
+        changes = list(self._changes)
+        # The current change may have started after the last history fetch.
+        current = self._current_change
+        if current is not None and all(c.get("id") != current.get("id") for c in changes):
+            changes.append(current)
+        return [
+            c
+            for c in changes
+            if (start := _parse_utc(c.get("startTime"))) is not None and start >= midnight
+        ]
+
+    @property
+    def native_value(self) -> int | None:
+        return len(self._today()) if self._history is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        today = self._today()
+        return {
+            "diapers": sum(len(c.get("diapers") or []) for c in today),
+            "since": dt_util.start_of_local_day().isoformat(),
+        }
+
+
+class ChangeHistorySensor(_HistoryEntity, SensorEntity):
+    """Changes of the last CHANGE_HISTORY_DAYS days, with statistics per diaper type.
+
+    Durations, leak rates and per-type figures only use completed changes. The
+    'changes' attribute lists the most recent changes for markdown cards.
+    """
+
+    _attr_name = f"Changes Last {CHANGE_HISTORY_DAYS} Days"
+    _attr_icon = "mdi:chart-timeline-variant"
+    _attr_native_unit_of_measurement = "changes"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _unrecorded_attributes = frozenset({"changes", "by_type"})
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "changes_30_days")
+
+    @property
+    def native_value(self) -> int | None:
+        return len(self._changes) if self._history is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        changes = self._changes
+        done = [c for c in changes if _change_duration(c) is not None]
+        durations = [_change_duration(c) for c in done]
+        leaks = sum(1 for c in done if c.get("leak"))
+
+        by_type: dict[str, dict[str, Any]] = {}
+        cost = 0.0
+        priced = False
+        for change in done:
+            for diaper in change.get("diapers") or []:
+                if diaper.get("price") is not None:
+                    cost += diaper["price"]
+                    priced = True
+            # Per-type figures use the main (first) diaper of each change.
+            details = _diaper_details(change)
+            if not details:
+                continue
+            name = details[0]["name"]
+            entry = by_type.setdefault(name, {"name": name, "changes": 0, "durations": [], "leaks": 0})
+            entry["changes"] += 1
+            entry["durations"].append(_change_duration(change))
+            entry["leaks"] += 1 if change.get("leak") else 0
+
+        accident_counts = _accidents_per_change(changes, self.coordinator.data.get("accidents", []))
+
+        return {
+            "completed": len(done),
+            "average_duration_minutes": _average(durations),
+            "longest_duration_minutes": max(durations) if durations else None,
+            "leaks": leaks,
+            "leak_rate_percent": round(100 * leaks / len(done)) if done else None,
+            "messy_overflows": sum(1 for c in done if c.get("messyOverflow")),
+            "wet": sum(1 for c in done if c.get("state") in ("WET", "WET_MESSY")),
+            "messy": sum(1 for c in done if c.get("state") in ("MESSY", "WET_MESSY")),
+            "dry": sum(1 for c in done if c.get("state") == "DRY"),
+            "day": sum(1 for c in changes if c.get("changePeriod") == "DAY"),
+            "night": sum(1 for c in changes if c.get("changePeriod") == "NIGHT"),
+            "cost": round(cost, 2) if priced else None,
+            "by_type": sorted(
+                (
+                    {
+                        "name": t["name"],
+                        "changes": t["changes"],
+                        "average_duration_minutes": _average(t["durations"]),
+                        "leaks": t["leaks"],
+                    }
+                    for t in by_type.values()
+                ),
+                key=lambda t: t["changes"],
+                reverse=True,
+            ),
+            "changes": [
+                _change_summary(c, accident_counts) for c in changes[:CHANGE_HISTORY_LENGTH]
+            ],
+        }
+
+
+class PreviousChangeSensor(_HistoryEntity, SensorEntity):
+    """The most recent completed change: diaper(s) as state, details as attributes."""
+
+    _attr_name = "Previous Change"
+    _attr_icon = "mdi:history"
+
+    def __init__(self, coordinator: DiapStashCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "previous_change")
+
+    def _previous(self) -> dict[str, Any] | None:
+        return next((c for c in self._changes if c.get("endTime") is not None), None)
+
+    @property
+    def native_value(self) -> str | None:
+        change = self._previous()
+        return _change_names(change) if change else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        change = self._previous()
+        if change is None:
+            return {}
+        return _change_summary(
+            change, _accidents_per_change([change], self.coordinator.data.get("accidents", []))
+        )
 
 
 # --- Diagnostics ----------------------------------------------------------------

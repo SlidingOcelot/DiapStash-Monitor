@@ -17,8 +17,14 @@ from homeassistant.util import dt as dt_util
 
 from .api import DiapStashApiClient, DiapStashRateLimitError, _parse_ratelimit_header
 from .const import (
+    ACCIDENT_LOCATION_DIAPER,
     ACCIDENT_LOCATION_TOILET,
     API_CALLS_PER_POLL,
+    CHANGE_FETCH_SIZE,
+    CHANGE_HISTORY_DAYS,
+    HISTORY_API_CALLS,
+    HISTORY_REFRESH_INTERVAL,
+    STREAK_BREAK_MINUTES,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
@@ -83,8 +89,8 @@ def _diaper_details(change: dict[str, Any]) -> list[dict[str, Any]]:
         ).get("url")
         result.append(
             {
-                "name": type_info.get("name") or str(d.get("typeId")),
-                "brand": (type_info.get("brand") or {}).get("name"),
+                "name": (type_info.get("name") or "").strip() or str(d.get("typeId")),
+                "brand": ((type_info.get("brand") or {}).get("name") or "").strip() or None,
                 "variant": variant.get("name"),
                 "size": d.get("size"),
                 "type_id": d.get("typeId"),
@@ -117,6 +123,11 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._seen_accident_ids: set[str] | None = None
         # True for the first poll after loading IDs from storage (see _fire_new_accident_events).
         self._restored = False
+        # Lifetime stats, streak and recent changes: fetched less often than the rest,
+        # see _maybe_fetch_history. The last good copy is kept between fetches.
+        self._history: dict[str, Any] | None = None
+        self._history_fetched_at: datetime | None = None
+        self._history_signature: tuple[Any, ...] | None = None
         self._store: Store[dict[str, Any]] = Store(
             hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.seen_accidents"
         )
@@ -247,6 +258,7 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             current_change, all_accidents
         )
         await self._fire_new_accident_events(all_accidents, accidents_for_change)
+        history = await self._maybe_fetch_history(latest_change)
 
         return {
             "latest_change": latest_change,
@@ -266,7 +278,70 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 (a for a in all_accidents if a.get("location") == ACCIDENT_LOCATION_TOILET),
                 None,
             ),
+            # Lifetime stats, streak and recent changes, or None if never fetched.
+            "history": history,
         }
+
+    async def _maybe_fetch_history(
+        self, latest_change: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Refresh stats, streak and recent changes when they may have changed.
+
+        They only change when a change starts, ends or is edited (visible in the
+        latest change's id, endTime and updatedAt), so they are fetched then, plus
+        every HISTORY_REFRESH_INTERVAL for the rolling windows. The fetch is skipped
+        while the remaining quota cannot spare it; errors other than auth and rate
+        limits keep the previous data, so the main sensors are never affected.
+        """
+        now = dt_util.utcnow()
+        signature = (
+            (latest_change or {}).get("id"),
+            (latest_change or {}).get("endTime"),
+            (latest_change or {}).get("updatedAt"),
+        )
+        due = (
+            self._history is None
+            or signature != self._history_signature
+            or self._history_fetched_at is None
+            or now - self._history_fetched_at >= timedelta(minutes=HISTORY_REFRESH_INTERVAL)
+        )
+        remaining = self.ratelimit.get("remaining")
+        if not due or (
+            remaining is not None
+            and remaining < RATELIMIT_RESERVE + HISTORY_API_CALLS + API_CALLS_PER_POLL
+        ):
+            return self._history
+
+        # Also the retry time after a failure, so errors cannot burn the quota.
+        self._history_fetched_at = now
+        since = now - timedelta(days=CHANGE_HISTORY_DAYS)
+        try:
+            stats = await self._client.get_stats()
+            streak = await self._client.get_streak(STREAK_BREAK_MINUTES)
+            changes = await self._client.get_changes(
+                since.isoformat().replace("+00:00", "Z"), CHANGE_FETCH_SIZE
+            )
+        except (DiapStashRateLimitError, ConfigEntryAuthFailed):
+            raise
+        except aiohttp.ClientResponseError as err:
+            if err.status == 401:
+                raise
+            _LOGGER.warning("DiapStash statistics unavailable: HTTP %s", err.status)
+            return self._history
+        except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+            _LOGGER.warning("DiapStash statistics unavailable: %s", err)
+            return self._history
+
+        self._history_signature = signature
+        self._history = {
+            "stats": stats,
+            "streak": streak,
+            # Newest first; includes the ongoing change, if any.
+            "changes": changes,
+            "since": since,
+            "fetched_at": now,
+        }
+        return self._history
 
     @staticmethod
     def _partition(
@@ -278,7 +353,9 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         are historical and belong to neither list. DiapStash only fills linkedChangeId
         when a change closes, so during an active change its accidents are unlinked
         and are matched by timestamp instead: unlinked accidents at or after the
-        change start belong to it, earlier ones happened without a diaper.
+        change start belong to it. Earlier unlinked ones are outside a change unless
+        they were logged "in diaper": DiapStash does not always link those to the
+        change that was worn, so they are past accidents, not ones without a diaper.
         """
         for_change: list[dict[str, Any]] = []
         outside: list[dict[str, Any]] = []
@@ -292,13 +369,11 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if linked is not None:
                 if linked == change_id:
                     for_change.append(a)
-            elif change_start is not None:
-                when = _parse_utc(a.get("when"))
-                if when is not None and when >= change_start:
-                    for_change.append(a)
-                else:
-                    outside.append(a)
-            else:
+                continue
+            when = _parse_utc(a.get("when"))
+            if change_start is not None and when is not None and when >= change_start:
+                for_change.append(a)
+            elif a.get("location") != ACCIDENT_LOCATION_DIAPER:
                 outside.append(a)
         return for_change, outside
 

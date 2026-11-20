@@ -12,7 +12,7 @@ from homeassistant.data_entry_flow import FlowResultType
 
 from custom_components.diapstash.const import CONF_SCAN_INTERVAL, DOMAIN, EVENT_ACCIDENT
 
-from .conftest import CLIENT_ID, ago, make_accident, make_change, mock_api
+from .conftest import CLIENT_ID, ago, make_accident, make_change, make_stats, mock_api
 
 
 async def _setup(hass: HomeAssistant, entry: MockConfigEntry) -> None:
@@ -40,15 +40,17 @@ async def test_active_change(
         make_accident("a4", ago(minutes=40), "wetting", level=4, leak=True),
         make_accident("t1", ago(hours=1), "wetting", location="toilet"),
         make_accident("a3", ago(hours=2), "wetting", level=1),
-        make_accident("a2", ago(hours=5), "wetting", level=2),  # before change: outside
+        make_accident("a2", ago(hours=5), "wetting", level=2, location="self"),  # outside
+        make_accident("d1", ago(hours=6), "wetting", level=2),  # in diaper, unlinked: not outside
         make_accident("a1", ago(days=3), "mess", level=2, linked=7),  # older change
     ]
     mock_api(aioclient_mock, make_change(start), accidents)
     await _setup(hass, config_entry)
     assert config_entry.state is ConfigEntryState.LOADED
 
-    # Only the two documented endpoints are called, with the client-id header.
-    assert aioclient_mock.call_count == 2
+    # latest-change + accidents, plus stats, streak and changes on the first poll,
+    # all with the client-id header.
+    assert aioclient_mock.call_count == 5
     for _method, _url, _data, headers in aioclient_mock.mock_calls:
         assert headers["DS-API-CLIENT-ID"] == CLIENT_ID
 
@@ -84,9 +86,9 @@ async def test_active_change(
     assert outside.attributes["id"] == "a2"
 
     week = _state(hass, "sensor.diapstash_accidents_last_7_days")
-    assert week.state == "5"  # toilet visit excluded
+    assert week.state == "6"  # toilet visit excluded
     assert week.attributes["toilet_visits"] == 1
-    assert [a["id"] for a in week.attributes["history"]] == ["a5", "a4", "t1", "a3", "a2", "a1"]
+    assert [a["id"] for a in week.attributes["history"]] == ["a5", "a4", "t1", "a3", "a2", "d1", "a1"]
 
     quota = _state(hass, "sensor.diapstash_api_requests_remaining")
     assert quota.state == "118"
@@ -99,7 +101,7 @@ async def test_not_wearing(
 ) -> None:
     """A closed latest change means not wearing; change sensors are unknown."""
     change = make_change(ago(hours=5), end=ago(hours=1))
-    mock_api(aioclient_mock, change, [make_accident("a1", ago(minutes=30), "mess")])
+    mock_api(aioclient_mock, change, [make_accident("a1", ago(minutes=30), "mess", location="self")])
     await _setup(hass, config_entry)
 
     assert _state(hass, "sensor.diapstash_current_diaper").state == "not wearing"
@@ -199,6 +201,132 @@ async def test_last_accident_skips_toilet_visits(
     assert last.attributes["id"] == "a1"
     assert last.attributes["last_toilet_visit"] == toilet["when"]
     assert last.attributes["last_toilet_visit_type"] == "mess"
+
+
+def _history_fixture():
+    """An ongoing change continuing a streak, plus two completed changes."""
+    current = make_change(ago(hours=3, minutes=10), change_id=3)
+    previous = make_change(
+        ago(hours=8), end=ago(hours=3, minutes=20), change_id=2, leak=True, state="WET"
+    )
+    older = make_change(ago(days=2, hours=4), end=ago(days=2), change_id=1, state="DRY")
+    streak = {
+        "changeCount": 3,
+        "diaperCount": 4,
+        "totalTimeInDiaperMinutes": 600,
+        "startAt": ago(days=1).isoformat(),
+        "endAt": previous["endTime"],
+    }
+    return current, [current, previous, older], streak
+
+
+async def test_history_sensors(
+    hass: HomeAssistant, config_entry: MockConfigEntry, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Lifetime stats, streak and change history populate their sensors."""
+    current, changes, streak = _history_fixture()
+    accidents = [
+        make_accident("a1", ago(hours=5), linked=2),
+        make_accident("u1", ago(days=2, hours=1)),  # unlinked, during the older change
+    ]
+    mock_api(aioclient_mock, current, accidents, stats=make_stats(), streak=streak, changes=changes)
+    await _setup(hass, config_entry)
+
+    total = _state(hass, "sensor.diapstash_total_changes")
+    assert total.state == "120"
+    assert total.attributes["last_7_days"] == 9 and total.attributes["night_changes"] == 40
+    assert _state(hass, "sensor.diapstash_total_diapers_used").state == "150"
+    # 10 h completed + 3 h 10 min worn now
+    assert float(_state(hass, "sensor.diapstash_total_time_in_diapers").state) in (13.17, 13.18)
+    assert _state(hass, "sensor.diapstash_average_change_duration").state == "240"
+
+    # The current change started 10 min after the streak ended: it continues it.
+    streak_state = _state(hass, "sensor.diapstash_diaper_streak")
+    assert float(streak_state.state) in (13.17, 13.18)  # 600 + 190 min
+    assert streak_state.attributes["active"] is True
+    assert streak_state.attributes["changes"] == 4
+    assert streak_state.attributes["diapers"] == 6
+
+    history = _state(hass, "sensor.diapstash_changes_last_30_days")
+    assert history.state == "3"
+    attrs = history.attributes
+    assert attrs["completed"] == 2
+    assert attrs["average_duration_minutes"] == 260  # (280 + 240) / 2
+    assert attrs["leaks"] == 1 and attrs["leak_rate_percent"] == 50
+    assert attrs["wet"] == 1 and attrs["dry"] == 1
+    assert attrs["cost"] == 3.5
+    assert attrs["by_type"] == [
+        {"name": "Main Diaper", "changes": 2, "average_duration_minutes": 260, "leaks": 1}
+    ]
+    assert [c["id"] for c in attrs["changes"]] == [3, 2, 1]
+    assert [c["accidents"] for c in attrs["changes"]] == [0, 1, 1]
+    assert attrs["changes"][0]["duration_minutes"] is None  # ongoing
+
+    prev = _state(hass, "sensor.diapstash_previous_change")
+    assert prev.state == "Main Diaper, Booster"
+    assert prev.attributes["duration_minutes"] == 280
+    assert prev.attributes["leak"] is True
+    assert prev.attributes["accidents"] == 1
+    # The unlinked in-diaper accident is not an accident outside a diaper.
+    assert _state(hass, "sensor.diapstash_last_outside_accident").state == "unknown"
+
+    assert _state(hass, "sensor.diapstash_changes_today").state in ("1", "2", "3")
+
+
+async def test_streak_broken_by_long_gap(
+    hass: HomeAssistant, config_entry: MockConfigEntry, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """A change started long after the last streak ended starts a new streak."""
+    current = make_change(ago(hours=1), change_id=9)
+    streak = {
+        "changeCount": 5, "diaperCount": 5, "totalTimeInDiaperMinutes": 1200,
+        "startAt": ago(days=3).isoformat(), "endAt": ago(hours=2).isoformat(),
+    }
+    mock_api(aioclient_mock, current, [], streak=streak)
+    await _setup(hass, config_entry)
+    state = _state(hass, "sensor.diapstash_diaper_streak")
+    assert float(state.state) in (1.0, 1.02)
+    assert state.attributes["changes"] == 1 and state.attributes["diapers"] == 2
+
+
+async def test_history_fetched_only_when_needed(
+    hass: HomeAssistant, config_entry: MockConfigEntry, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Stats are re-fetched when the latest change changes, not on every poll."""
+    change = make_change(ago(hours=1), change_id=5)
+    mock_api(aioclient_mock, change, [])
+    await _setup(hass, config_entry)
+    coordinator = _coordinator(hass, config_entry)
+
+    mock_api(aioclient_mock, change, [])
+    await coordinator.async_refresh()
+    assert aioclient_mock.call_count == 2  # latest-change + accidents only
+
+    closed = make_change(ago(hours=1), end=ago(minutes=1), change_id=5)
+    mock_api(aioclient_mock, closed, [])
+    await coordinator.async_refresh()
+    assert aioclient_mock.call_count == 5  # the change ended: stats re-fetched
+
+
+async def test_history_errors_do_not_break_main_sensors(
+    hass: HomeAssistant, config_entry: MockConfigEntry, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """A failing stats endpoint leaves the history sensors unavailable, nothing else."""
+    mock_api(aioclient_mock, make_change(ago(hours=1)), [], history_status=500)
+    await _setup(hass, config_entry)
+    assert config_entry.state is ConfigEntryState.LOADED
+    assert _state(hass, "sensor.diapstash_current_diaper").state == "Main Diaper, Booster"
+    assert _state(hass, "sensor.diapstash_total_changes").state == "unavailable"
+
+
+async def test_history_skipped_when_quota_low(
+    hass: HomeAssistant, config_entry: MockConfigEntry, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """With little quota left the stats fetch is postponed."""
+    mock_api(aioclient_mock, None, [], remaining=8, reset=3000)
+    await _setup(hass, config_entry)
+    assert aioclient_mock.call_count == 2
+    assert _state(hass, "sensor.diapstash_total_changes").state == "unavailable"
 
 
 async def test_interval_stretches_when_quota_low(

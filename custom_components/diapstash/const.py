@@ -27,6 +27,9 @@ SCOPES = ["offline_access", "cloud-sync.history", "cloud-sync.accidents", "cloud
 # (intentionally or not) rather than soiling the diaper. Such accidents are excluded
 # from the change-based sensors and daily counts so they do not inflate diaper state.
 ACCIDENT_LOCATION_TOILET = "toilet"
+# Accidents logged "in diaper" never count as outside a change, even when DiapStash
+# left them unlinked (it does not always link accidents to the change worn).
+ACCIDENT_LOCATION_DIAPER = "diaper"
 
 # --- Polling and rate limits ---
 # The DiapStash API allows 120 requests per hour per (API client, user) pair; the
@@ -56,3 +59,17 @@ EVENT_ACCIDENT = "diapstash_accident"
 # announced, so a long outage does not flood automations with stale alerts.
 STORAGE_VERSION = 1
 RESTART_EVENT_MAX_AGE = 60  # minutes
+
+# --- Lifetime statistics, streak and change history ---
+# Fetched with HISTORY_API_CALLS extra requests, only when the latest change starts,
+# ends or is edited, and otherwise at most every HISTORY_REFRESH_INTERVAL so the
+# rolling windows stay current. Skipped while the remaining quota is low.
+HISTORY_API_CALLS = 3
+HISTORY_REFRESH_INTERVAL = 60  # minutes
+# Days of changes fetched for the change history sensors.
+CHANGE_HISTORY_DAYS = 30
+CHANGE_FETCH_SIZE = 200
+# Number of changes kept in the history attribute.
+CHANGE_HISTORY_LENGTH = 20
+# Maximum gap between two changes that still continues a streak (API: 0-30).
+STREAK_BREAK_MINUTES = 15

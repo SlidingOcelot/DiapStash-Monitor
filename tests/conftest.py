@@ -21,6 +21,9 @@ from custom_components.diapstash.const import (
 
 LATEST_CHANGE_URL = f"{API_BASE_URL}/api/v1/history/latest-change"
 ACCIDENTS_URL = f"{API_BASE_URL}/api/v1/history/accidents"
+STATS_URL = f"{API_BASE_URL}/api/v1/history/stats"
+STREAK_URL = f"{API_BASE_URL}/api/v1/history/stats/streak"
+CHANGES_URL = f"{API_BASE_URL}/api/v1/history/changes"
 CLIENT_ID = "test-client-id"
 
 
@@ -37,7 +40,13 @@ def ago(**kwargs: float) -> datetime:
     return datetime.now(timezone.utc) - timedelta(**kwargs)
 
 
-def make_change(start: datetime, end: datetime | None = None, change_id: int = 42) -> dict[str, Any]:
+def make_change(
+    start: datetime,
+    end: datetime | None = None,
+    change_id: int = 42,
+    leak: bool | None = None,
+    state: str | None = None,
+) -> dict[str, Any]:
     """A latest-change response as returned by the API, with inline type details."""
     return {
         "id": change_id,
@@ -45,9 +54,10 @@ def make_change(start: datetime, end: datetime | None = None, change_id: int = 4
         "endTime": iso(end) if end else None,
         "tags": None,
         "note": "test note",
-        "state": None,
+        "state": state,
         "changePeriod": "DAY",
-        "leak": None,
+        "leak": leak,
+        "updatedAt": iso(end or start),
         "messyOverflow": False,
         "diapers": [
             {
@@ -55,8 +65,9 @@ def make_change(start: datetime, end: datetime | None = None, change_id: int = 4
                 "typeId": 7,
                 "variantId": None,
                 "size": "M",
+                "price": 0.5,
                 "type": {
-                    "name": "Booster",
+                    "name": "Booster ",  # the catalogue has names with stray spaces
                     "brand": {"name": "BrandB"},
                     "primaryImage": {"url": "https://img/booster.png"},
                     "variant": None,
@@ -67,6 +78,7 @@ def make_change(start: datetime, end: datetime | None = None, change_id: int = 4
                 "typeId": 5,
                 "variantId": "v1",
                 "size": "L",
+                "price": 1.25,
                 "type": {
                     "name": "Main Diaper",
                     "brand": {"name": "BrandA"},
@@ -118,8 +130,12 @@ def mock_api(
     reset: int = 3500,
     change_status: int = 200,
     accidents_status: int = 200,
+    stats: dict[str, Any] | None = None,
+    streak: dict[str, Any] | None = None,
+    changes: list[dict[str, Any]] | None = None,
+    history_status: int = 200,
 ) -> None:
-    """(Re)register API responses. Accidents must be passed newest first."""
+    """(Re)register API responses. Accidents and changes must be passed newest first."""
     aioclient_mock.clear_requests()
     headers = ratelimit_headers(remaining, reset)
     if change is None and change_status == 200:
@@ -136,6 +152,43 @@ def mock_api(
         status=accidents_status,
         headers=headers,
     )
+    aioclient_mock.get(STATS_URL, json=stats or make_stats(), status=history_status, headers=headers)
+    aioclient_mock.get(
+        STREAK_URL,
+        json=streak or {"changeCount": 0, "diaperCount": 0, "totalTimeInDiaperMinutes": 0, "startAt": None, "endAt": None},
+        status=history_status,
+        headers=headers,
+    )
+    if changes is None:
+        changes = [change] if change is not None else []
+    aioclient_mock.get(
+        CHANGES_URL,
+        json={"page": 0, "size": 200, "count": len(changes), "totalCount": len(changes), "data": changes},
+        status=history_status,
+        headers=headers,
+    )
+
+
+def make_stats(**overrides: Any) -> dict[str, Any]:
+    stats = {
+        "changeCount": 120,
+        "diaperCount": 150,
+        "firstChangeAt": "2025-01-01T08:00:00.000Z",
+        "lastChangeAt": "2026-11-20T08:00:00.000Z",
+        "ongoing": False,
+        "totalTimeInDiaperSeconds": 36000,
+        "averageTimeInDiaperSeconds": 14400,
+        "wetCount": 90,
+        "messyCount": 20,
+        "dayCount": 80,
+        "nightCount": 40,
+        "changesByPeriod": {
+            "weekToDate": 3, "weekRolling": 9, "monthToDate": 30,
+            "monthRolling": 40, "yearToDate": 110, "yearRolling": 120,
+        },
+    }
+    stats.update(overrides)
+    return stats
 
 
 @pytest.fixture

@@ -31,6 +31,19 @@ All entities belong to one **DiapStash** device.
 | `sensor.diapstash_accidents_last_7_days` | Number | Accidents in the last 7 days, with the last 20 accidents as history |
 | `sensor.diapstash_api_requests_remaining` | Number | Diagnostic: API requests left in the current rate-limit hour |
 
+### Statistics and change history
+
+| Entity | State | Notes |
+|---|---|---|
+| `sensor.diapstash_total_changes` | Number | Changes ever recorded; per-period counts as attributes |
+| `sensor.diapstash_total_diapers_used` | Number | Diapers ever used (stacked diapers count individually) |
+| `sensor.diapstash_total_time_in_diapers` | Hours | Total time in diapers, including the diaper worn now |
+| `sensor.diapstash_average_change_duration` | Minutes | Average time a diaper is worn, over all completed changes |
+| `sensor.diapstash_diaper_streak` | Hours | Current or most recent run of back-to-back changes (gaps of up to 15 minutes) |
+| `sensor.diapstash_changes_today` | Number | Changes started since midnight, including the current one |
+| `sensor.diapstash_changes_last_30_days` | Number | Changes in the last 30 days, with durations, leak rate, cost, statistics per diaper type and the last 20 changes |
+| `sensor.diapstash_previous_change` | Diaper name(s) | The most recent completed change, with its duration and state |
+
 ### Binary sensors
 
 | Entity | On when |
@@ -69,7 +82,9 @@ Sensors are refreshed every **5 minutes** by default. Change it under **Settings
 
 Each refresh makes 2 API requests. The DiapStash API allows 120 requests per hour per API client and user, and reports the remaining quota with every response. If the remaining requests would not last until the quota resets, updates are automatically spread out over the rest of the hour; after an HTTP 429 the integration waits for the reset. `sensor.diapstash_api_requests_remaining` shows the current quota.
 
-Time-based sensors (time in diaper, accidents today) update every minute without extra API requests.
+The statistics and change history take 3 more requests, but only when a change starts, ends or is edited, and otherwise once an hour. They are postponed while the remaining quota is low, and a failure there never affects the other sensors.
+
+Time-based sensors (time in diaper, accidents today, streak, totals) update every minute without extra API requests.
 
 Only one DiapStash account can be configured per Home Assistant instance. Refresh tokens expire after 7 days without use; HA then shows a repair notice to re-authorise.
 
@@ -126,6 +141,35 @@ automation:
 | `toilet_visits` | Toilet visits in the period |
 | `since` | Start of the period |
 | `history` | 7-day sensor only: the last 20 accidents (newest first, toilet visits included) |
+
+### `sensor.diapstash_total_changes`
+| Attribute | Description |
+|---|---|
+| `first_change` | Start of the very first change |
+| `wet_changes` / `messy_changes` | Changes recorded as wet / messy (wet & messy counts in both) |
+| `day_changes` / `night_changes` | Changes by change period |
+| `this_week` / `this_month` / `this_year` | Changes since the start of the week, month, year (UTC) |
+| `last_7_days` / `last_month` / `last_year` | Changes in the rolling period |
+
+### `sensor.diapstash_diaper_streak`
+| Attribute | Description |
+|---|---|
+| `active` | The streak is still going: a diaper is worn now, or the last one came off less than 15 minutes ago |
+| `changes` / `diapers` | Changes and diapers in the streak |
+| `started` / `ended` | Start of the streak; end of its last change (empty while active) |
+| `break_minutes` | Longest gap between two changes that continues a streak |
+
+### `sensor.diapstash_changes_last_30_days`
+| Attribute | Description |
+|---|---|
+| `completed` | Completed changes (durations, leaks and states only count these) |
+| `average_duration_minutes` / `longest_duration_minutes` | Time worn per change |
+| `leaks` / `leak_rate_percent` / `messy_overflows` | Leaks and overflows |
+| `wet` / `messy` / `dry` | Changes by final state |
+| `day` / `night` | Changes by change period |
+| `cost` | Sum of the diaper prices recorded with the changes, if any |
+| `by_type` | Per main diaper type: `name`, `changes`, `average_duration_minutes`, `leaks` |
+| `changes` | The last 20 changes, newest first: `id`, `start`, `end`, `duration_minutes`, `diapers`, `state`, `wetness`, `messy_level`, `leak`, `messy_overflow`, `period`, `accidents` |
 
 ### `sensor.diapstash_last_accident`
 | Attribute | Description |

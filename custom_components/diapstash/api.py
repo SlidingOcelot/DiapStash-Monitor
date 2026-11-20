@@ -141,3 +141,28 @@ class DiapStashApiClient:
             params={"size": size, "sort": "when,desc"},
         )
         return data.get("data", [])
+
+    async def get_stats(self) -> dict[str, Any]:
+        """Return lifetime totals: changes, diapers, time in diapers, per-period counts."""
+        return await self._get("/api/v1/history/stats")
+
+    async def get_streak(self, break_minutes: int) -> dict[str, Any]:
+        """Return the most recent streak of completed changes.
+
+        Changes belong to the same streak while the gap between one change's end and
+        the next one's start is at most break_minutes (0-30).
+        """
+        return await self._get(
+            "/api/v1/history/stats/streak", params={"break": break_minutes}
+        )
+
+    async def get_changes(self, since: str, size: int) -> list[dict[str, Any]]:
+        """Return the changes started at or after `since` (ISO UTC), newest first.
+
+        Like latest-change, every diaper carries its type details inline.
+        """
+        data = await self._get(
+            "/api/v1/history/changes",
+            params={"size": size, "sort": "startTime,desc", "startTime.gte": since},
+        )
+        return data.get("data", [])
