@@ -156,6 +156,51 @@ async def test_new_accident_fires_event(
     assert len(events) == 1
 
 
+async def test_events_survive_restart(
+    hass: HomeAssistant, config_entry: MockConfigEntry, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """After a restart, recent unseen accidents are announced; old and seen ones not."""
+    events = []
+    hass.bus.async_listen(EVENT_ACCIDENT, events.append)
+
+    old = make_accident("old", ago(hours=3))
+    mock_api(aioclient_mock, None, [old])
+    await _setup(hass, config_entry)
+    assert events == []  # first-ever poll only seeds the stored IDs
+
+    assert await hass.config_entries.async_unload(config_entry.entry_id)
+    await hass.async_block_till_done()
+
+    # Logged while HA was down: one 5 minutes ago, one 2 hours ago (too old to alert).
+    recent = make_accident("recent", ago(minutes=5), "mess")
+    stale = make_accident("stale", ago(hours=2))
+    mock_api(aioclient_mock, None, [recent, stale, old])
+    await _setup(hass, config_entry)
+
+    assert [e.data["id"] for e in events] == ["recent"]
+
+    # The stale one is now known too: nothing fires on the next poll.
+    await _coordinator(hass, config_entry).async_refresh()
+    await hass.async_block_till_done()
+    assert len(events) == 1
+
+
+async def test_last_accident_skips_toilet_visits(
+    hass: HomeAssistant, config_entry: MockConfigEntry, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """A toilet visit is not the last accident but is shown in its attributes."""
+    toilet = make_accident("t1", ago(minutes=10), "mess", location="toilet")
+    real = make_accident("a1", ago(hours=2), "wetting")
+    mock_api(aioclient_mock, None, [toilet, real])
+    await _setup(hass, config_entry)
+
+    last = _state(hass, "sensor.diapstash_last_accident")
+    assert last.state == "wetting"
+    assert last.attributes["id"] == "a1"
+    assert last.attributes["last_toilet_visit"] == toilet["when"]
+    assert last.attributes["last_toilet_visit_type"] == "mess"
+
+
 async def test_interval_stretches_when_quota_low(
     hass: HomeAssistant, config_entry: MockConfigEntry, aioclient_mock: AiohttpClientMocker
 ) -> None:
@@ -224,6 +269,22 @@ async def test_options_flow_sets_interval(
 
     assert config_entry.options == {CONF_SCAN_INTERVAL: 15}
     assert _coordinator(hass, config_entry).update_interval == timedelta(minutes=15)
+
+
+async def test_token_refresh_does_not_reload(
+    hass: HomeAssistant, config_entry: MockConfigEntry, aioclient_mock: AiohttpClientMocker
+) -> None:
+    """Storing a refreshed token in entry.data must not reload the entry."""
+    mock_api(aioclient_mock, None, [])
+    await _setup(hass, config_entry)
+    coordinator = _coordinator(hass, config_entry)
+
+    token = {**config_entry.data["token"], "access_token": "refreshed"}
+    hass.config_entries.async_update_entry(config_entry, data={**config_entry.data, "token": token})
+    await hass.async_block_till_done()
+
+    assert _coordinator(hass, config_entry) is coordinator  # same instance: no reload
+    assert _state(hass, "sensor.diapstash_current_diaper").state == "not wearing"
 
 
 async def test_single_config_entry(hass: HomeAssistant, config_entry: MockConfigEntry) -> None:

@@ -25,7 +25,7 @@ All entities belong to one **DiapStash** device.
 | `sensor.diapstash_peak_messy_level` | 0–5 | Highest mess level in the current change |
 | `sensor.diapstash_last_wetting` | Timestamp | Most recent wetting in the current change |
 | `sensor.diapstash_last_mess` | Timestamp | Most recent mess in the current change |
-| `sensor.diapstash_last_accident` | `wetting` or `mess` | Most recent accident overall; all properties exposed as attributes |
+| `sensor.diapstash_last_accident` | `wetting` or `mess` | Most recent accident overall (toilet visits excluded); all properties exposed as attributes |
 | `sensor.diapstash_last_outside_accident` | `wetting` or `mess` | Most recent accident that happened while not wearing a diaper |
 | `sensor.diapstash_accidents_today` | Number | Accidents since midnight (toilet visits counted separately) |
 | `sensor.diapstash_accidents_last_7_days` | Number | Accidents in the last 7 days, with the last 20 accidents as history |
@@ -75,7 +75,7 @@ Only one DiapStash account can be configured per Home Assistant instance. Refres
 
 ## Events
 
-Every newly logged accident fires a `diapstash_accident` event (once, on the first update that sees it) and appears in the logbook. Accidents that already existed when HA started are not announced. Event data: `id`, `type`, `when`, `precision_time`, `level`, `cause`, `cause_leak`, `location`, `position`, `linked_change_id`, `during_change`.
+Every newly logged accident fires a `diapstash_accident` event (once, on the first update that sees it) and appears in the logbook. Accidents that already existed when the integration was first set up are not announced. Announced accidents are remembered across restarts: accidents logged while HA was down are announced after it starts, if they were logged within the last 60 minutes. Event data: `id`, `type`, `when`, `precision_time`, `level`, `cause`, `cause_leak`, `location`, `position`, `linked_change_id`, `during_change`.
 
 ```yaml
 automation:
@@ -136,8 +136,10 @@ automation:
 | `level` | Severity 0–5 |
 | `cause` | `purpose`, `uncontrolledAwake`, `uncontrolledSleeping` |
 | `cause_leak` | Whether a leak caused the accident |
-| `location` | `diaper`, `toilet`, `self` |
+| `location` | `diaper` or `self` (toilet visits are not accidents) |
 | `position` | `standing`, `sitting`, `lying`, `squatting` |
 | `linked_change_id` | Change the accident is linked to |
 | `created_at` | Record creation timestamp |
 | `updated_at` | Record last-updated timestamp |
+| `last_toilet_visit` | Timestamp of the most recent toilet visit |
+| `last_toilet_visit_type` | `wetting` or `mess` for that toilet visit |

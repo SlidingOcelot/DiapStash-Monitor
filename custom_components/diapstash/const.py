@@ -50,3 +50,9 @@ HISTORY_LENGTH = 20
 
 # Event fired once for every newly logged accident.
 EVENT_ACCIDENT = "diapstash_accident"
+
+# Accident IDs already announced are kept in HA storage so a restart neither repeats
+# nor drops events. After a restart only accidents created within this window are
+# announced, so a long outage does not flood automations with stale alerts.
+STORAGE_VERSION = 1
+RESTART_EVENT_MAX_AGE = 60  # minutes

@@ -11,7 +11,9 @@ import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .api import DiapStashApiClient, DiapStashRateLimitError, _parse_ratelimit_header
 from .const import (
@@ -24,6 +26,8 @@ from .const import (
     MAX_SCAN_INTERVAL,
     MIN_SCAN_INTERVAL,
     RATELIMIT_RESERVE,
+    RESTART_EVENT_MAX_AGE,
+    STORAGE_VERSION,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -108,9 +112,25 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=self.configured_interval,
         )
         self._client = client
-        # IDs of accidents already seen. None until the first successful poll, which
-        # only seeds the set so existing accidents do not fire events after a restart.
+        # IDs of accidents already seen, persisted across restarts. None only on the
+        # very first poll after installing, which seeds the set without firing events.
         self._seen_accident_ids: set[str] | None = None
+        # True for the first poll after loading IDs from storage (see _fire_new_accident_events).
+        self._restored = False
+        self._store: Store[dict[str, Any]] = Store(
+            hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.seen_accidents"
+        )
+
+    async def async_load_seen_accidents(self) -> None:
+        """Load the accident IDs announced before the last restart."""
+        stored = await self._store.async_load()
+        if stored and isinstance(stored.get("ids"), list):
+            self._seen_accident_ids = set(stored["ids"])
+            self._restored = True
+
+    async def async_remove_store(self) -> None:
+        """Delete the stored accident IDs (integration removed)."""
+        await self._store.async_remove()
 
     @property
     def configured_interval(self) -> timedelta:
@@ -226,7 +246,7 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         accidents_for_change, accidents_outside_change = self._partition(
             current_change, all_accidents
         )
-        self._fire_new_accident_events(all_accidents, accidents_for_change)
+        await self._fire_new_accident_events(all_accidents, accidents_for_change)
 
         return {
             "latest_change": latest_change,
@@ -237,7 +257,15 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "accidents_outside_change": accidents_outside_change,
             # Newest first, everything including toilet visits.
             "accidents": all_accidents,
-            "last_accident": all_accidents[0] if all_accidents else None,
+            # Newest real accident (toilet visits excluded) and newest toilet visit.
+            "last_accident": next(
+                (a for a in all_accidents if a.get("location") != ACCIDENT_LOCATION_TOILET),
+                None,
+            ),
+            "last_toilet_visit": next(
+                (a for a in all_accidents if a.get("location") == ACCIDENT_LOCATION_TOILET),
+                None,
+            ),
         }
 
     @staticmethod
@@ -274,26 +302,38 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 outside.append(a)
         return for_change, outside
 
-    def _fire_new_accident_events(
+    async def _fire_new_accident_events(
         self,
         all_accidents: list[dict[str, Any]],
         accidents_for_change: list[dict[str, Any]],
     ) -> None:
         """Fire EVENT_ACCIDENT once for every accident not seen in a previous poll.
 
-        The first poll after startup only records the existing accidents. Events are
-        fired oldest first so automations and the logbook see them in order.
+        The very first poll after installing only records the existing accidents. The
+        seen IDs are stored, so after a restart accidents logged while HA was down are
+        still announced - but only those created within RESTART_EVENT_MAX_AGE minutes.
+        Events are fired oldest first so automations and the logbook see them in order.
         """
         ids = {a["id"] for a in all_accidents if a.get("id")}
         if self._seen_accident_ids is None:
             self._seen_accident_ids = ids
+            await self._store.async_save({"ids": sorted(ids)})
             return
+
+        cutoff = None
+        if self._restored:
+            cutoff = dt_util.utcnow() - timedelta(minutes=RESTART_EVENT_MAX_AGE)
+            self._restored = False
 
         in_change = {a.get("id") for a in accidents_for_change}
         for accident in reversed(all_accidents):
             accident_id = accident.get("id")
             if not accident_id or accident_id in self._seen_accident_ids:
                 continue
+            if cutoff is not None:
+                created = _parse_utc(accident.get("createdAt") or accident.get("when"))
+                if created is None or created < cutoff:
+                    continue
             self.hass.bus.async_fire(
                 EVENT_ACCIDENT,
                 {
@@ -304,4 +344,7 @@ class DiapStashCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         # Only accidents still in the fetched window are remembered; one that drops
         # out of the window cannot come back as "new".
-        self._seen_accident_ids = ids
+        # Written only when the set changes, i.e. when accidents are logged.
+        if ids != self._seen_accident_ids:
+            self._seen_accident_ids = ids
+            await self._store.async_save({"ids": sorted(ids)})

@@ -5,9 +5,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import config_entry_oauth2_flow
+from homeassistant.helpers.storage import Store
 
 from .api import DiapStashApiClient
-from .const import DOMAIN
+from .const import DOMAIN, STORAGE_VERSION
 from .coordinator import DiapStashCoordinator
 
 # All HA platform types that this integration registers entities on.
@@ -46,6 +47,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     coordinator = DiapStashCoordinator(hass, entry, client)
+    await coordinator.async_load_seen_accidents()
     # Perform the first data fetch synchronously so HA can report setup failure
     # immediately (e.g. auth error, network unreachable) rather than deferring it.
     await coordinator.async_config_entry_first_refresh()
@@ -53,14 +55,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     # Reload when the options (update interval) change so the coordinator picks up
-    # the new interval immediately.
-    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+    # the new interval immediately. The listener also fires whenever the OAuth session
+    # stores a refreshed token in entry.data (every hour), so compare the options and
+    # ignore every other update - reloading then would blank all entities and forget
+    # which accidents were already announced.
+    loaded_options = dict(entry.options)
+
+    async def _async_entry_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+        if dict(entry.options) != loaded_options:
+            await hass.config_entries.async_reload(entry.entry_id)
+
+    entry.async_on_unload(entry.add_update_listener(_async_entry_updated))
     return True
 
 
-async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the entry after its options were changed."""
-    await hass.config_entries.async_reload(entry.entry_id)
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete the stored accident IDs when the integration is removed."""
+    await Store(hass, STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.seen_accidents").async_remove()
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

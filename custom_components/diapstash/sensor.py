@@ -423,7 +423,11 @@ class LastMessTimeSensor(_LastOfTypeTimeSensor):
 
 
 class LastAccidentSensor(_DiapStashEntity, SensorEntity):
-    """Most recent accident overall, regardless of change context or location."""
+    """Most recent accident overall, regardless of change context.
+
+    Toilet visits are not accidents and are excluded, matching the counts; the most
+    recent toilet visit is exposed in the last_toilet_visit attributes instead.
+    """
 
     _attr_name = "Last Accident"
     _attr_icon = "mdi:water-alert"
@@ -439,13 +443,17 @@ class LastAccidentSensor(_DiapStashEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         accident = self.coordinator.data.get("last_accident")
-        if not accident:
-            return {}
-        return {
-            **accident_summary(accident),
-            "created_at": accident.get("createdAt"),
-            "updated_at": accident.get("updatedAt"),
-        }
+        toilet = self.coordinator.data.get("last_toilet_visit")
+        attrs: dict[str, Any] = {}
+        if accident:
+            attrs = {
+                **accident_summary(accident),
+                "created_at": accident.get("createdAt"),
+                "updated_at": accident.get("updatedAt"),
+            }
+        attrs["last_toilet_visit"] = toilet.get("when") if toilet else None
+        attrs["last_toilet_visit_type"] = toilet.get("type") if toilet else None
+        return attrs
 
 
 class LastOutsideAccidentSensor(_DiapStashEntity, SensorEntity):
